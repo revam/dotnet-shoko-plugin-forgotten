@@ -5,7 +5,29 @@
   "authors": "revam",
   "repository_url": "https://github.com/revam/dotnet-shoko-plugin-forgotten",
   "homepage_url": null,
-  "tags": ["password-reset", "account-recovery", "hosted-service", "api"],
+  "tags": [
+    "password-reset",
+    "account-recovery",
+    "hosted-service",
+    "api"
+  ],
   "thumbnail": null,
-  "releases": []
+  "releases": [
+    {
+      "version": "1.0.0",
+      "tag": "v1.0.0",
+      "source_revision": "32472b7563b465e2143b34e06938d11ce30a443b",
+      "released_at": "2026-05-07T15:17:20Z",
+      "channel": "Stable",
+      "release_notes": null,
+      "archives": [
+        {
+          "runtime": "any",
+          "abstraction": "6.0.0",
+          "url": "https://github.com/revam/dotnet-shoko-plugin-forgotten/releases/download/v1.0.0/Shoko.Plugin.Forgotten-v1.0.0-any.zip",
+          "checksum": "087b6a8184ec65592c29c593fd19ac4686271b9432161f9993da55d501f50e03"
+        }
+      ]
+    }
+  ]
 }
