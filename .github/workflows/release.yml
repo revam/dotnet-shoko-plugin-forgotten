@@ -73,8 +73,7 @@ jobs:
             }')
 
           jq --argjson release "$RELEASE_ENTRY" '
-            .releases |= [ $release ] + . |
-            .releases |= unique_by(.version)
+            .releases |= [ $release ] + (. | map(select(.version != $release.version)))
           ' manifest.json > manifest.json.tmp && mv manifest.json.tmp manifest.json
 
           git config user.name "github-actions[bot]"

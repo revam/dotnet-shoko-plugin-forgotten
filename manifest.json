@@ -14,18 +14,18 @@
   "thumbnail": null,
   "releases": [
     {
-      "version": "1.0.0",
-      "tag": "v1.0.0",
-      "source_revision": "32472b7563b465e2143b34e06938d11ce30a443b",
-      "released_at": "2026-05-07T15:17:20Z",
+      "version": "1.0.2",
+      "tag": "v1.0.2",
+      "source_revision": "fb00269f7bf72ca9f7a0d6acf2f0e33e6dd08513",
+      "released_at": "2026-05-07T15:50:26Z",
       "channel": "Stable",
       "release_notes": null,
       "archives": [
         {
           "runtime": "any",
           "abstraction": "6.0.0",
-          "url": "https://github.com/revam/dotnet-shoko-plugin-forgotten/releases/download/v1.0.0/Shoko.Plugin.Forgotten-v1.0.0-any.zip",
-          "checksum": "087b6a8184ec65592c29c593fd19ac4686271b9432161f9993da55d501f50e03"
+          "url": "https://github.com/revam/dotnet-shoko-plugin-forgotten/releases/download/v1.0.2/Shoko.Plugin.Forgotten-v1.0.2-any.zip",
+          "checksum": "4ea3aaf9a36a74abbf2664b3eb326806b3ddceb09396fb68742196808e2e0fa5"
         }
       ]
     },
@@ -46,18 +46,18 @@
       ]
     },
     {
-      "version": "1.0.2",
-      "tag": "v1.0.2",
-      "source_revision": "fb00269f7bf72ca9f7a0d6acf2f0e33e6dd08513",
-      "released_at": "2026-05-07T15:50:26Z",
+      "version": "1.0.0",
+      "tag": "v1.0.0",
+      "source_revision": "32472b7563b465e2143b34e06938d11ce30a443b",
+      "released_at": "2026-05-07T15:17:20Z",
       "channel": "Stable",
       "release_notes": null,
       "archives": [
         {
           "runtime": "any",
           "abstraction": "6.0.0",
-          "url": "https://github.com/revam/dotnet-shoko-plugin-forgotten/releases/download/v1.0.2/Shoko.Plugin.Forgotten-v1.0.2-any.zip",
-          "checksum": "4ea3aaf9a36a74abbf2664b3eb326806b3ddceb09396fb68742196808e2e0fa5"
+          "url": "https://github.com/revam/dotnet-shoko-plugin-forgotten/releases/download/v1.0.0/Shoko.Plugin.Forgotten-v1.0.0-any.zip",
+          "checksum": "087b6a8184ec65592c29c593fd19ac4686271b9432161f9993da55d501f50e03"
         }
       ]
     }
