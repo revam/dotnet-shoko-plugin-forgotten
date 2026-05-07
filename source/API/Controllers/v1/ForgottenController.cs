@@ -153,6 +153,16 @@ public class ForgottenController(
     }
 
     /// <summary>
+    /// Checks if the plugin is installed and operational.
+    /// </summary>
+    /// <returns>An empty 200 OK response.</returns>
+    [HttpGet("Status")]
+    public IActionResult GetStatus()
+    {
+        return Ok();
+    }
+
+    /// <summary>
     /// Requests a list of all registered usernames (logged for security purposes).
     /// </summary>
     /// <returns>An action result containing the response with the request timestamp.</returns>

@@ -7,7 +7,7 @@
         <Title>Shoko Forgotten</Title>
         <Authors>revam</Authors>
         <RepositoryUrl>https://github.com/revam/dotnet-shoko-plugin-forgotten</RepositoryUrl>
-        <Version>1.0.0</Version>
+        <Version>1.0.1</Version>
         <Configurations>Debug;Release</Configurations>
         <Platforms>AnyCPU;x64</Platforms>
         <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
