@@ -62,6 +62,7 @@ All endpoints are unauthenticated and served under `/api/plugin/Forgotten/v1/`:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| `GET` | `Status` | Check if the plugin is installed (returns 200 OK) |
 | `POST` | `RequestReset` | Submit username, get token logged to server console |
 | `POST` | `VerifyToken` | Check if a token is valid |
 | `POST` | `ResetPassword` | Consume token and set new password |
