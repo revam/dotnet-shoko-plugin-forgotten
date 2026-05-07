@@ -56,10 +56,26 @@ public class ForgottenController(
             });
         }
 
-        _logger.LogWarning("Password reset requested for username: {Username}. Client IPs: {IPs}", request.Username, ips);
+        // Check if IP has been locked out from excessive failed attempts
+        if (!_tokenStore.CanAttemptVerify(ips, out var nextAllowedAt))
+        {
+            _logger.LogWarning("Password reset request denied for username: {Username} — IP locked out from too many failed attempts. Client IPs: {IPs}", request.Username, ips);
+            var response = new ForgottenResponse
+            {
+                Success = false,
+                Message = "Too many failed attempts. Please try again later."
+            };
+            if (nextAllowedAt.HasValue)
+            {
+                response.RetryAfter = nextAllowedAt.Value;
+                var retryAfterSeconds = (int)(nextAllowedAt.Value - DateTimeOffset.UtcNow).TotalSeconds;
+                Response.Headers.RetryAfter = retryAfterSeconds.ToString();
+            }
+            return StatusCode(429, response);
+        }
 
         // Check rate limits
-        if (!_tokenStore.CanRequestReset(ips, request.Username, out var nextAllowedAt))
+        if (!_tokenStore.CanRequestReset(ips, request.Username, out nextAllowedAt))
         {
             _logger.LogWarning("Password reset request denied for username: {Username} due to rate limiting. Client IPs: {IPs}", request.Username, ips);
             var response = new ForgottenResponse
@@ -85,6 +101,13 @@ public class ForgottenController(
             var token = _tokenStore.Generate(request.Username, ips);
             _logger.LogInformation("Reset token for user {Username}: {Token}. Client IPs: {IPs}", request.Username, token, ips);
         }
+        else
+        {
+            // Dummy operation to prevent timing-based username enumeration
+            // Must match the cost of Generate above (cryptographic token)
+            _tokenStore.GenerateDummy();
+            _logger.LogWarning("Password reset requested for username: {Username}. Client IPs: {IPs}", request.Username, ips);
+        }
 
         return Ok(new ForgottenResponse { Message = "If the username exists, a reset code has been logged." });
     }
@@ -107,8 +130,53 @@ public class ForgottenController(
             });
         }
 
-        var valid = _tokenStore.Verify(request.Username, request.Token, ips);
-        return Ok(new ForgottenResponse { Valid = valid });
+        if (!_tokenStore.IsValidTokenFormat(request.Token))
+        {
+            return StatusCode(400, new ForgottenResponse
+            {
+                Success = false,
+                Message = "Invalid token format. Token must be 12 hexadecimal characters."
+            });
+        }
+
+        // Check IP rate limiting
+        if (!_tokenStore.CanAttemptVerify(ips, out var nextAllowedAt))
+        {
+            _logger.LogWarning("Token verification rate limited for IP: {IPs}", ips);
+            var response = new ForgottenResponse
+            {
+                Success = false,
+                Message = "Too many attempts. Please try again later."
+            };
+            if (nextAllowedAt.HasValue)
+            {
+                response.RetryAfter = nextAllowedAt.Value;
+                var retryAfterSeconds = (int)(nextAllowedAt.Value - DateTimeOffset.UtcNow).TotalSeconds;
+                Response.Headers.RetryAfter = retryAfterSeconds.ToString();
+            }
+            return StatusCode(429, response);
+        }
+
+        // Attempt verification (doesn't decrement attempts if valid)
+        var allowed = _tokenStore.TryVerify(request.Username, request.Token, ips, out var isValid);
+        if (!allowed)
+        {
+            _logger.LogWarning("Token verification blocked - token locked out for username: {Username}", request.Username);
+            return StatusCode(403, new ForgottenResponse
+            {
+                Success = false,
+                Message = "Token has been locked due to too many failed attempts."
+            });
+        }
+
+        // Only record the attempt if the token was invalid
+        // This preserves attempts for valid tokens to be used in ResetPassword
+        if (!isValid)
+        {
+            _tokenStore.RecordVerifyAttempt(ips);
+        }
+
+        return Ok(new ForgottenResponse { Valid = isValid });
     }
 
     /// <summary>
@@ -129,9 +197,51 @@ public class ForgottenController(
             });
         }
 
+        if (!_tokenStore.IsValidTokenFormat(request.Token))
+        {
+            return StatusCode(400, new ForgottenResponse
+            {
+                Success = false,
+                Message = "Invalid token format. Token must be 12 hexadecimal characters."
+            });
+        }
+
+        // Check IP rate limiting
+        if (!_tokenStore.CanAttemptVerify(ips, out var nextAllowedAt))
+        {
+            _logger.LogWarning("Password reset rate limited for IP: {IPs}", ips);
+            var response = new ForgottenResponse
+            {
+                Success = false,
+                Message = "Too many attempts. Please try again later."
+            };
+            if (nextAllowedAt.HasValue)
+            {
+                response.RetryAfter = nextAllowedAt.Value;
+                var retryAfterSeconds = (int)(nextAllowedAt.Value - DateTimeOffset.UtcNow).TotalSeconds;
+                Response.Headers.RetryAfter = retryAfterSeconds.ToString();
+            }
+            return StatusCode(429, response);
+        }
+
         _logger.LogWarning("Password reset attempt for username: {Username}. Client IPs: {IPs}", request.Username, ips);
 
-        if (!_tokenStore.Consume(request.Username, request.Token, ips))
+        // Attempt to consume the token
+        var allowed = _tokenStore.TryConsume(request.Username, request.Token, ips, out var consumed);
+        if (!allowed)
+        {
+            _logger.LogWarning("Password reset blocked - token locked out for username: {Username}", request.Username);
+            return StatusCode(403, new ForgottenResponse
+            {
+                Success = false,
+                Message = "Token has been locked due to too many failed attempts."
+            });
+        }
+
+        // Record the attempt regardless of outcome
+        _tokenStore.RecordVerifyAttempt(ips);
+
+        if (!consumed)
         {
             _logger.LogWarning("Password reset failed — invalid/expired token or IP mismatch for username: {Username}. Client IPs: {IPs}", request.Username, ips);
             return StatusCode(403, new ForgottenResponse { Success = false, Message = "Invalid or expired token." });
@@ -178,8 +288,25 @@ public class ForgottenController(
             });
         }
 
+        // Check if IP has been locked out from excessive failed attempts
+        if (!_tokenStore.CanAttemptVerify(ips, out var nextAllowedAt))
+        {
+            _logger.LogWarning("Username recovery request denied — IP locked out from too many failed attempts. Client IPs: {IPs}", ips);
+            var response = new RequestUsernamesResponse
+            {
+                Message = "Too many failed attempts. Please try again later.",
+                RetryAfter = nextAllowedAt
+            };
+            if (nextAllowedAt.HasValue)
+            {
+                var retryAfterSeconds = (int)(nextAllowedAt.Value - DateTimeOffset.UtcNow).TotalSeconds;
+                Response.Headers.RetryAfter = retryAfterSeconds.ToString();
+            }
+            return StatusCode(429, response);
+        }
+
         // Check global rate limit (24h cooldown)
-        if (!_tokenStore.CanRequestUsernames(out var nextAllowedAt))
+        if (!_tokenStore.CanRequestUsernames(out nextAllowedAt))
         {
             _logger.LogWarning("Username recovery request denied due to global rate limiting. Client IPs: {IPs}", ips);
             var response = new RequestUsernamesResponse
