@@ -1,0 +1,11 @@
+{
+  "id": "118ffeee-943d-40b2-af63-2416da4beca9",
+  "name": "Forgotten",
+  "overview": "Password reset and username recovery for Shoko. Provides a 4-step forgot-password flow and a forgot-username sub-flow.",
+  "authors": "revam",
+  "repository_url": "https://github.com/revam/dotnet-shoko-plugin-forgotten",
+  "homepage_url": null,
+  "tags": ["password-reset", "account-recovery", "hosted-service", "api"],
+  "thumbnail": null,
+  "releases": []
+}
