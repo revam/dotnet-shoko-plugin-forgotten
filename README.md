@@ -6,7 +6,7 @@ A [Shoko](https://shokoanime.com/) plugin that handles password reset and userna
 
 - **Forgot Password** — 4-step wizard flow: username entry, token verification, new password, confirmation.
 - **Forgot Username** — Logs all registered usernames to the server console on request.
-- **Token-based Auth** — Crypto-random 32-char reset tokens with 15-minute expiry, stored in memory.
+- **Token-based Auth** — Crypto-random 12-char hex reset tokens with 15-minute expiry, stored in memory, displayed in XXXX-XXXX-XXXX format.
 - **Audit Logging** — Every reset request and attempt is logged with full client IP chain (X-Forwarded-For).
 - **Rate Limiting** — Prevents abuse with strict request limits.
 - **IP Security** — Tokens are bound to the requesting IP address.
