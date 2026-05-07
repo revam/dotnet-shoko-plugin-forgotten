@@ -44,6 +44,22 @@
           "checksum": "da37db0f065fd45c97dd6cf2f3bb33ae2ea5400b3528fb585bbd65a345b8c856"
         }
       ]
+    },
+    {
+      "version": "1.0.2",
+      "tag": "v1.0.2",
+      "source_revision": "fb00269f7bf72ca9f7a0d6acf2f0e33e6dd08513",
+      "released_at": "2026-05-07T15:50:26Z",
+      "channel": "Stable",
+      "release_notes": null,
+      "archives": [
+        {
+          "runtime": "any",
+          "abstraction": "6.0.0",
+          "url": "https://github.com/revam/dotnet-shoko-plugin-forgotten/releases/download/v1.0.2/Shoko.Plugin.Forgotten-v1.0.2-any.zip",
+          "checksum": "4ea3aaf9a36a74abbf2664b3eb326806b3ddceb09396fb68742196808e2e0fa5"
+        }
+      ]
     }
   ]
 }
