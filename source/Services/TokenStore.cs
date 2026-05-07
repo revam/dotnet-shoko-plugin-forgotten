@@ -82,8 +82,10 @@ public class TokenStore
             }
 
             // Check for concurrent request for same username+IP
-            if (entry.HasPendingRequestForUsername(username))
+            if (entry.TryGetPendingRequestTime(username, out var requestTime))
             {
+                // Calculate when the pending request will expire
+                nextAllowedAt = requestTime + TokenExpiry;
                 return false;
             }
         }
@@ -216,16 +218,16 @@ public class TokenStore
     {
         public DateTimeOffset WindowStart { get; set; }
         public int Count { get; set; }
-        private readonly ConcurrentDictionary<string, bool> _pendingUsernames = new();
+        private readonly ConcurrentDictionary<string, DateTimeOffset> _pendingUsernames = new();
 
-        public bool HasPendingRequestForUsername(string username)
+        public bool TryGetPendingRequestTime(string username, out DateTimeOffset requestTime)
         {
-            return _pendingUsernames.ContainsKey(username);
+            return _pendingUsernames.TryGetValue(username, out requestTime);
         }
 
         public void AddPendingUsername(string username)
         {
-            _pendingUsernames[username] = true;
+            _pendingUsernames[username] = DateTimeOffset.UtcNow;
         }
     }
 }
