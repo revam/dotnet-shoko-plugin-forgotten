@@ -256,7 +256,7 @@ public class ForgottenController(
         }
 
         await _userService.ChangeUserPassword(user, request.NewPassword);
-        await _userService.InvalidateRestApiTokensForUser(user);
+        await _userService.InvalidateApiTokensForUser(user);
 
         _logger.LogWarning("Password reset successful for user: {Username}. Client IPs: {IPs}", request.Username, ips);
 
