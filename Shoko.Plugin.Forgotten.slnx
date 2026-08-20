@@ -2,4 +2,7 @@
   <Folder Name="/source/">
     <Project Path="source/Shoko.Plugin.Forgotten.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Shoko.Plugin.Forgotten.Tests.csproj" />
+  </Folder>
 </Solution>
