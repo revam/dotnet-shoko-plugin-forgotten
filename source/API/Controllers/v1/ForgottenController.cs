@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using System.Linq;
 using System.Net;
 using System.Threading.Tasks;
@@ -39,83 +40,71 @@ public class ForgottenController(
 
     private readonly ConfigurationProvider<ForgottenPluginConfiguration> _configurationProvider = configurationProvider;
 
-  /// <summary>
-  /// Requests a password reset token for the specified username.
-  /// </summary>
-  /// <param name="request">The request containing the username.</param>
-  /// <returns>An action result containing the response.</returns>
-  [HttpPost("RequestReset")]
+    /// <summary>
+    /// Requests a password reset token for the specified username.
+    /// </summary>
+    /// <param name="request">The request containing the username.</param>
+    /// <returns>An action result containing the response.</returns>
+    [HttpPost("RequestReset")]
     public ActionResult<ForgottenResponse> RequestReset([FromBody] RequestResetRequest request)
     {
         if (!TryGetClientIps(out var ips))
         {
             _logger.LogError("Password reset request denied — unable to determine client IP address");
-            return StatusCode(400, new ForgottenResponse
-            {
-                Success = false,
-                Message = "Unable to determine client IP address."
-            });
+            return StatusCode(400, Failure("Unable to determine client IP address."));
         }
 
-        // Check if IP has been locked out from excessive failed attempts
-        if (!_tokenStore.CanAttemptVerify(ips, out var nextAllowedAt))
+        if (TokenStore.NormalizeUsername(request.Username) is not { } username)
+            return StatusCode(400, Failure("Invalid username."));
+
+        var outcome = _tokenStore.TryStartReset(username, ips, out var nextAllowedAt);
+        if (outcome is not ResetRequestResult.Ok)
         {
-            _logger.LogWarning("Password reset request denied for username: {Username} — IP locked out from too many failed attempts. Client IPs: {IPs}", request.Username, ips);
-            var response = new ForgottenResponse
+            _logger.LogWarning("Password reset request denied for username {Username}: {Reason}. Client IPs: {IPs}", username, outcome, ips);
+            return RateLimited(outcome switch
             {
-                Success = false,
-                Message = "Too many failed attempts. Please try again later."
-            };
-            if (nextAllowedAt.HasValue)
-            {
-                response.RetryAfter = nextAllowedAt.Value;
-                var retryAfterSeconds = (int)(nextAllowedAt.Value - DateTimeOffset.UtcNow).TotalSeconds;
-                Response.Headers.RetryAfter = retryAfterSeconds.ToString();
-            }
-            return StatusCode(429, response);
+                ResetRequestResult.AttemptsExhausted => "Too many failed attempts. Please try again later.",
+                ResetRequestResult.AlreadyPending => "A reset code has already been issued. Please use it or wait for it to expire.",
+                _ => "Rate limit exceeded. Please try again later.",
+            }, nextAllowedAt);
         }
 
-        // Check rate limits
-        if (!_tokenStore.CanRequestReset(ips, request.Username, out nextAllowedAt))
-        {
-            _logger.LogWarning("Password reset request denied for username: {Username} due to rate limiting. Client IPs: {IPs}", request.Username, ips);
-            var response = new ForgottenResponse
-            {
-                Success = false,
-                Message = "Rate limit exceeded. Please try again later."
-            };
-            if (nextAllowedAt.HasValue)
-            {
-                response.RetryAfter = nextAllowedAt.Value;
-                var retryAfterSeconds = (int)(nextAllowedAt.Value - DateTimeOffset.UtcNow).TotalSeconds;
-                Response.Headers.RetryAfter = retryAfterSeconds.ToString();
-            }
-            return StatusCode(429, response);
-        }
+        // Logged identically whether or not the account exists, and before
+        // the lookup that would tell us, so that raising the log level can
+        // never leave the miss visible while hiding the hit.
+        _logger.LogInformation("Password reset requested for username {Username}. Client IPs: {IPs}", username, ips);
 
-        // Record the request for rate limiting
-        _tokenStore.RecordResetRequest(ips, request.Username);
-
-        var user = _userService.GetUserByUsername(request.Username);
-        if (user is not null)
+        var user = _userService.GetUserByUsername(username);
+        if (user is null)
         {
-            var token = _tokenStore.Generate(request.Username, ips);
-            _logger.LogInformation("Reset token for user {Username}: {Token}. Client IPs: {IPs}", request.Username, token, ips);
+            // Dummy operation to prevent timing-based username enumeration.
+            // Must match the cost of Generate below (cryptographic token).
+            _tokenStore.GenerateDummy();
         }
         else
         {
-            // Dummy operation to prevent timing-based username enumeration
-            // Must match the cost of Generate above (cryptographic token)
-            _tokenStore.GenerateDummy();
-            _logger.LogWarning("Password reset requested for username: {Username}. Client IPs: {IPs}", request.Username, ips);
+            var token = _tokenStore.Generate(username, ips);
+
+            // The log is the delivery channel — there is no mail transport
+            // here — so the token line has to survive an operator raising
+            // the level, and it is genuinely worth a warning in its own
+            // right: a credential is now sitting in plain text on a console.
+            _logger.LogWarning("Reset token for user {Username}: {Token}. Client IPs: {IPs}", username, token, ips);
         }
 
-        return Ok(new ForgottenResponse { Message = "If the username exists, a reset code has been logged." });
+        return Ok(new ForgottenResponse { Success = true, Message = "If the username exists, a reset code has been logged." });
     }
 
     /// <summary>
     /// Verifies if a reset token is valid for the specified username.
     /// </summary>
+    /// <remarks>
+    /// A token that does not check out answers 200 with <c>valid: false</c>
+    /// rather than a status that says why. The address it was issued to,
+    /// whether it has expired, and whether it was ever issued at all are all
+    /// folded into the same answer on purpose: telling them apart would
+    /// confirm a guessed token to whoever guessed it.
+    /// </remarks>
     /// <param name="request">The request containing the username and token.</param>
     /// <returns>An action result containing the validation response.</returns>
     [HttpPost("VerifyToken")]
@@ -124,60 +113,26 @@ public class ForgottenController(
         if (!TryGetClientIps(out var ips))
         {
             _logger.LogError("Token verification denied — unable to determine client IP address");
-            return StatusCode(400, new ForgottenResponse
-            {
-                Success = false,
-                Message = "Unable to determine client IP address."
-            });
+            return StatusCode(400, Failure("Unable to determine client IP address."));
         }
 
-        if (!_tokenStore.IsValidTokenFormat(request.Token))
+        var result = _tokenStore.TryVerify(request.Username, request.Token, ips, out var nextAllowedAt);
+        switch (result)
         {
-            return StatusCode(400, new ForgottenResponse
-            {
-                Success = false,
-                Message = "Invalid token format. Token must be 12 hexadecimal characters."
-            });
-        }
+            case TokenAttemptResult.Malformed:
+                return StatusCode(400, Failure("Invalid username or token format. A token is 12 hexadecimal characters."));
 
-        // Check IP rate limiting
-        if (!_tokenStore.CanAttemptVerify(ips, out var nextAllowedAt))
-        {
-            _logger.LogWarning("Token verification rate limited for IP: {IPs}", ips);
-            var response = new ForgottenResponse
-            {
-                Success = false,
-                Message = "Too many attempts. Please try again later."
-            };
-            if (nextAllowedAt.HasValue)
-            {
-                response.RetryAfter = nextAllowedAt.Value;
-                var retryAfterSeconds = (int)(nextAllowedAt.Value - DateTimeOffset.UtcNow).TotalSeconds;
-                Response.Headers.RetryAfter = retryAfterSeconds.ToString();
-            }
-            return StatusCode(429, response);
-        }
+            case TokenAttemptResult.RateLimited:
+                _logger.LogWarning("Token verification rate limited for IP: {IPs}", ips);
+                return RateLimited("Too many attempts. Please try again later.", nextAllowedAt);
 
-        // Attempt verification (doesn't decrement attempts if valid)
-        var allowed = _tokenStore.TryVerify(request.Username, request.Token, ips, out var isValid);
-        if (!allowed)
-        {
-            _logger.LogWarning("Token verification blocked - token locked out for username: {Username}", request.Username);
-            return StatusCode(403, new ForgottenResponse
-            {
-                Success = false,
-                Message = "Token has been locked due to too many failed attempts."
-            });
-        }
+            case TokenAttemptResult.LockedOut:
+                _logger.LogWarning("Token verification blocked — the token has taken too many failed attempts. Client IPs: {IPs}", ips);
+                return StatusCode(403, Failure("Token has been locked due to too many failed attempts."));
 
-        // Only record the attempt if the token was invalid
-        // This preserves attempts for valid tokens to be used in ResetPassword
-        if (!isValid)
-        {
-            _tokenStore.RecordVerifyAttempt(ips);
+            default:
+                return Ok(new ForgottenResponse { Success = true, Valid = result is TokenAttemptResult.Ok });
         }
-
-        return Ok(new ForgottenResponse { Valid = isValid });
     }
 
     /// <summary>
@@ -191,74 +146,79 @@ public class ForgottenController(
         if (!TryGetClientIps(out var ips))
         {
             _logger.LogError("Password reset denied — unable to determine client IP address");
-            return StatusCode(400, new ForgottenResponse
-            {
-                Success = false,
-                Message = "Unable to determine client IP address."
-            });
+            return StatusCode(400, Failure("Unable to determine client IP address."));
         }
 
-        if (!_tokenStore.IsValidTokenFormat(request.Token))
+        // Checked before the token is spent, not after. The host rejects a
+        // password over its limit with a validation exception, and a token
+        // spent on a request that was never going to succeed is a token the
+        // user no longer has.
+        //
+        // Empty is not rejected: Shoko supports passwordless accounts and
+        // this endpoint has no business overruling that.
+        if (!TokenStore.IsAcceptablePassword(request.NewPassword))
+            return StatusCode(400, Failure($"Password cannot be longer than {TokenStore.MaxPasswordLength} characters."));
+
+        var result = _tokenStore.TryConsume(request.Username, request.Token, ips, out var ticket, out var nextAllowedAt);
+        switch (result)
         {
-            return StatusCode(400, new ForgottenResponse
-            {
-                Success = false,
-                Message = "Invalid token format. Token must be 12 hexadecimal characters."
-            });
-        }
+            case TokenAttemptResult.Malformed:
+                return StatusCode(400, Failure("Invalid username or token format. A token is 12 hexadecimal characters."));
 
-        // Check IP rate limiting
-        if (!_tokenStore.CanAttemptVerify(ips, out var nextAllowedAt))
-        {
-            _logger.LogWarning("Password reset rate limited for IP: {IPs}", ips);
-            var response = new ForgottenResponse
-            {
-                Success = false,
-                Message = "Too many attempts. Please try again later."
-            };
-            if (nextAllowedAt.HasValue)
-            {
-                response.RetryAfter = nextAllowedAt.Value;
-                var retryAfterSeconds = (int)(nextAllowedAt.Value - DateTimeOffset.UtcNow).TotalSeconds;
-                Response.Headers.RetryAfter = retryAfterSeconds.ToString();
-            }
-            return StatusCode(429, response);
-        }
+            case TokenAttemptResult.RateLimited:
+                _logger.LogWarning("Password reset rate limited for IP: {IPs}", ips);
+                return RateLimited("Too many attempts. Please try again later.", nextAllowedAt);
 
-        _logger.LogWarning("Password reset attempt for username: {Username}. Client IPs: {IPs}", request.Username, ips);
+            case TokenAttemptResult.LockedOut:
+                _logger.LogWarning("Password reset blocked — the token has taken too many failed attempts. Client IPs: {IPs}", ips);
+                return StatusCode(403, Failure("Token has been locked due to too many failed attempts."));
 
-        // Attempt to consume the token
-        var allowed = _tokenStore.TryConsume(request.Username, request.Token, ips, out var consumed);
-        if (!allowed)
-        {
-            _logger.LogWarning("Password reset blocked - token locked out for username: {Username}", request.Username);
-            return StatusCode(403, new ForgottenResponse
-            {
-                Success = false,
-                Message = "Token has been locked due to too many failed attempts."
-            });
-        }
-
-        // Record the attempt regardless of outcome
-        _tokenStore.RecordVerifyAttempt(ips);
-
-        if (!consumed)
-        {
-            _logger.LogWarning("Password reset failed — invalid/expired token or IP mismatch for username: {Username}. Client IPs: {IPs}", request.Username, ips);
-            return StatusCode(403, new ForgottenResponse { Success = false, Message = "Invalid or expired token." });
+            case not TokenAttemptResult.Ok:
+                _logger.LogWarning("Password reset failed — invalid or expired token, or address mismatch. Client IPs: {IPs}", ips);
+                return StatusCode(403, Failure("Invalid or expired token."));
         }
 
         var user = _userService.GetUserByUsername(request.Username);
         if (user is null)
         {
-            _logger.LogWarning("Password reset failed — user {Username} no longer exists after token verification. Client IPs: {IPs}", request.Username, ips);
-            return StatusCode(403, new ForgottenResponse { Success = false, Message = "Invalid or expired token." });
+            // The account went away between the token being issued and being
+            // spent. Nothing was changed, so the token goes back.
+            ticket!.Restore();
+            _logger.LogWarning("Password reset failed — the user no longer exists. Client IPs: {IPs}", ips);
+            return StatusCode(403, Failure("Invalid or expired token."));
         }
 
-        await _userService.ChangeUserPassword(user, request.NewPassword);
-        await _userService.InvalidateApiTokensForUser(user);
+        try
+        {
+            await _userService.ChangeUserPassword(user, request.NewPassword).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // The host refused. It is the only party that changes anything
+            // here, so if it refused then nothing changed and the token has
+            // not really been spent — hand it back rather than leaving the
+            // user with neither a new password nor a way to set one.
+            ticket!.Restore();
+            _logger.LogError(ex, "Password reset failed — the host rejected the new password for user {Username}. Client IPs: {IPs}", user.Username, ips);
+            return StatusCode(500, Failure("The password could not be changed. The reset code is still valid; please try again."));
+        }
 
-        _logger.LogWarning("Password reset successful for user: {Username}. Client IPs: {IPs}", request.Username, ips);
+        // The password is changed, so the token really is spent — and with it
+        // anything else the account had outstanding.
+        ticket!.Commit();
+        _logger.LogWarning("Password reset successful for user {Username}. Client IPs: {IPs}", user.Username, ips);
+
+        try
+        {
+            await _userService.InvalidateApiTokensForUser(user).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // The reset itself stands; say so, but do not claim the tokens
+            // were revoked when they were not.
+            _logger.LogError(ex, "Password was reset for user {Username}, but existing API tokens could not be revoked.", user.Username);
+            return Ok(new ForgottenResponse { Success = true, Message = "Password has been reset, but existing API tokens could not be revoked." });
+        }
 
         return Ok(new ForgottenResponse { Success = true, Message = "Password has been reset. All API tokens have been revoked." });
     }
@@ -269,9 +229,7 @@ public class ForgottenController(
     /// <returns>An empty 200 OK response.</returns>
     [HttpGet("Status")]
     public IActionResult GetStatus()
-    {
-        return Ok();
-    }
+        => Ok();
 
     /// <summary>
     /// Requests a list of all registered usernames (logged for security purposes).
@@ -289,52 +247,55 @@ public class ForgottenController(
             });
         }
 
-        // Check if IP has been locked out from excessive failed attempts
-        if (!_tokenStore.CanAttemptVerify(ips, out var nextAllowedAt))
+        if (_tokenStore.IsAttemptBudgetExhausted(ips, out var nextAllowedAt))
         {
             _logger.LogWarning("Username recovery request denied — IP locked out from too many failed attempts. Client IPs: {IPs}", ips);
-            var response = new RequestUsernamesResponse
+            return RateLimited(new RequestUsernamesResponse
             {
                 Message = "Too many failed attempts. Please try again later.",
-                RetryAfter = nextAllowedAt
-            };
-            if (nextAllowedAt.HasValue)
-            {
-                var retryAfterSeconds = (int)(nextAllowedAt.Value - DateTimeOffset.UtcNow).TotalSeconds;
-                Response.Headers.RetryAfter = retryAfterSeconds.ToString();
-            }
-            return StatusCode(429, response);
+                RetryAfter = nextAllowedAt,
+            }, nextAllowedAt);
         }
 
-        // Check global rate limit (24h cooldown)
-        if (!_tokenStore.CanRequestUsernames(out nextAllowedAt))
+        // Claiming the cooldown and dumping the names is one operation, so
+        // two requests arriving together cannot both find the cooldown clear.
+        if (!_tokenStore.TryRecordUsernameRequest(out nextAllowedAt))
         {
             _logger.LogWarning("Username recovery request denied due to global rate limiting. Client IPs: {IPs}", ips);
-            var response = new RequestUsernamesResponse
+            return RateLimited(new RequestUsernamesResponse
             {
                 Message = "Username recovery can only be requested once every 24 hours.",
-                RetryAfter = nextAllowedAt
-            };
-            if (nextAllowedAt.HasValue)
-            {
-                var retryAfterSeconds = (int)(nextAllowedAt.Value - DateTimeOffset.UtcNow).TotalSeconds;
-                Response.Headers.RetryAfter = retryAfterSeconds.ToString();
-            }
-            return StatusCode(429, response);
+                RetryAfter = nextAllowedAt,
+            }, nextAllowedAt);
         }
 
         _logger.LogWarning("Username recovery requested. Client IPs: {IPs}", ips);
-        _tokenStore.RecordUsernameRequest();
 
-        var users = _userService.GetUsers();
-        foreach (var user in users)
+        foreach (var user in _userService.GetUsers())
             _logger.LogWarning("Registered username: {Username}", user.Username);
 
         return Ok(new RequestUsernamesResponse
         {
             RequestedAt = DateTimeOffset.UtcNow,
-            RetryAfter = DateTimeOffset.UtcNow.AddDays(1)
+            RetryAfter = DateTimeOffset.UtcNow.Add(TokenStore.UsernameRequestCooldown),
         });
+    }
+
+    private static ForgottenResponse Failure(string message)
+        => new() { Success = false, Message = message };
+
+    private ActionResult<ForgottenResponse> RateLimited(string message, DateTimeOffset? nextAllowedAt)
+        => RateLimited(new ForgottenResponse { Success = false, Message = message, RetryAfter = nextAllowedAt }, nextAllowedAt);
+
+    private ActionResult<TResponse> RateLimited<TResponse>(TResponse response, DateTimeOffset? nextAllowedAt)
+    {
+        if (nextAllowedAt.HasValue)
+        {
+            var retryAfterSeconds = (int)Math.Max(0, (nextAllowedAt.Value - DateTimeOffset.UtcNow).TotalSeconds);
+            Response.Headers.RetryAfter = retryAfterSeconds.ToString(CultureInfo.InvariantCulture);
+        }
+
+        return StatusCode(429, response);
     }
 
     /// <summary>
