@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
 using Shoko.Abstractions.Config;
+using Shoko.Abstractions.User;
 using Shoko.Abstractions.User.Services;
 using Shoko.Plugin.Forgotten.API.Models;
 using Shoko.Plugin.Forgotten.Configuration;
@@ -79,7 +80,16 @@ public class ForgottenController(
         {
             // Dummy operation to prevent timing-based username enumeration.
             // Must match the cost of Generate below (cryptographic token).
-            _tokenStore.GenerateDummy();
+            var discarded = _tokenStore.GenerateDummy();
+
+            // And a matched log write, because the equalisation above is worth
+            // little beside one. Shoko's file target runs with
+            // KeepFileOpen = false, so every event is an open, a write and a
+            // close on this thread before the response goes out; a hit that
+            // wrote two lines against a miss that wrote one was a far larger
+            // signal than the entropy either path generates. Same level, same
+            // shape, same argument count - and the value is thrown away.
+            _logger.LogWarning("No reset token issued for user {Username}: {Token}. Client IPs: {IPs}", username, discarded, ips);
         }
         else
         {
@@ -185,7 +195,27 @@ public class ForgottenController(
                 return StatusCode(403, Failure("Invalid or expired token."));
         }
 
-        var user = _userService.GetUserByUsername(request.Username);
+        // Normalized, because the store trims and the host does not: an
+        // untrimmed name verified here and 404'd there, costing an attempt
+        // for input the previous call had just called valid.
+        //
+        // Guarded, because this is the one call between spending the token
+        // and settling for it. An exception escaping here left the ticket
+        // unsettled, and an unsettled ticket is a token marked spent that
+        // nothing will ever hand back - the user loses their reset to a
+        // fault that had nothing to do with them.
+        IUser? user;
+        try
+        {
+            user = _userService.GetUserByUsername(TokenStore.NormalizeUsername(request.Username)!);
+        }
+        catch (Exception ex)
+        {
+            ticket!.Restore();
+            _logger.LogError(ex, "Password reset failed — the user lookup threw. Client IPs: {IPs}", ips);
+            return StatusCode(500, Failure("The password could not be changed. The reset code is still valid; please try again."));
+        }
+
         if (user is null)
         {
             // The account went away between the token being issued and being

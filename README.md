@@ -108,9 +108,17 @@ guessed it:
 - `ResetPassword` answers **403 Forbidden**. It is an action, and it was
   refused.
 
-A token that has taken too many failed attempts is reported separately, as
-**403 Forbidden**, by both endpoints — that state is already public to anyone
-who caused it.
+A token that has taken too many failed attempts is **not** reported
+separately. It answers exactly as an unknown token does, and costs the caller
+the same. A lockout can only exist for an account that has a live token, so a
+distinct answer would have said "this account exists and has a reset in
+flight" — the one question every other line here is written to refuse — and
+reading it cost nothing, so it could be re-asked indefinitely.
+
+Only the address a token is bound to can spend that token's attempts. A guess
+from anywhere else cannot succeed whatever it contains, so counting it would
+only have let a stranger exhaust the ceiling and deny the real user their
+reset.
 
 ## API Endpoints
 

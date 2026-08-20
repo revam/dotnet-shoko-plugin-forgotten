@@ -396,4 +396,60 @@ public class TokenStoreTests
 
         Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", second, OtherIp, out _));
     }
+
+    /// <summary>
+    /// A guess from anywhere but the bound address cannot succeed whatever it
+    /// contains, so it must not spend the account's ceiling either - or a
+    /// stranger can deny a victim their reset for as long as the token lives.
+    /// </summary>
+    [Fact]
+    public void A_stranger_cannot_burn_the_ceiling_on_someone_elses_token()
+    {
+        var (store, _) = NewStore();
+        var token = Issue(store, "admin");
+
+        for (var attempt = 0; attempt < TokenStore.MaxFailedAttemptsPerToken * 2; attempt++)
+            Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", Guess(attempt), OtherIp, out _));
+
+        Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", token, Ip, out _));
+    }
+
+    /// <summary>
+    /// The pending check and the token map have to agree on what counts as
+    /// the same name, or a spelling that differs only by a character ICU
+    /// ignores slips past the first and lands on the same account in the
+    /// second - displacing a live token once per attempt.
+    /// </summary>
+    [Fact]
+    public void A_name_the_token_map_calls_equal_is_already_pending()
+    {
+        var (store, _) = NewStore();
+        Assert.Equal(ResetRequestResult.Ok, store.TryStartReset("alice", Ip, out _));
+
+        Assert.Equal(ResetRequestResult.AlreadyPending, store.TryStartReset("ALICE", Ip, out _));
+        Assert.Equal(ResetRequestResult.AlreadyPending, store.TryStartReset("alice\u200d", Ip, out _));
+    }
+
+    /// <summary>
+    /// char.IsControl is Cc only. The characters that actually reorder a
+    /// console line are Cf and the separators, and the console is where a
+    /// token is delivered.
+    /// </summary>
+    [Theory]
+    [InlineData("ad\u202emin")]
+    [InlineData("ad\u2066min")]
+    [InlineData("ad\u200dmin")]
+    [InlineData("ad\u2028min")]
+    [InlineData("ad\u0085min")]
+    [InlineData("ad\nmin")]
+    public void A_username_that_could_rewrite_a_console_line_is_refused(string username)
+        => Assert.Null(TokenStore.NormalizeUsername(username));
+
+    [Theory]
+    [InlineData("admin")]
+    [InlineData("  admin  ")]
+    [InlineData("admin-2")]
+    [InlineData("\u00e5se")]
+    public void An_ordinary_username_still_passes(string username)
+        => Assert.NotNull(TokenStore.NormalizeUsername(username));
 }

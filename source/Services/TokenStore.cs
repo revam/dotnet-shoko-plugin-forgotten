@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
@@ -108,7 +109,12 @@ public sealed class TokenStore : IDisposable
     /// an invented one, and the difference between 429 and 200 is a
     /// perfectly good way to enumerate accounts.
     /// </remarks>
-    private readonly Dictionary<string, DateTimeOffset> _pendingRequests = new(StringComparer.Ordinal);
+    // Invariant-culture, case-insensitive, to agree with _tokens above. With
+    // an ordinal comparer over a lowercased key these two disagreed about
+    // characters ICU ignores - a zero-width joiner spelled a name that missed
+    // the pending check here and hit the same account there, so one address
+    // could displace an account's live token repeatedly.
+    private readonly Dictionary<string, DateTimeOffset> _pendingRequests = new(StringComparer.InvariantCultureIgnoreCase);
 
     private readonly Lock _gate = new();
 
@@ -165,7 +171,15 @@ public sealed class TokenStore : IDisposable
         if (trimmed.Length is 0 || trimmed.Length > MaxUsernameLength)
             return null;
 
-        return trimmed.Any(char.IsControl) ? null : trimmed;
+        // char.IsControl is Cc only, which lets through the characters that
+        // actually reorder a console line: bidi overrides and isolates
+        // (U+202A-202E, U+2066-2069), the zero-width joiner, and the line and
+        // paragraph separators. The console layout this ends up in is
+        // unescaped, and it is how a reset token reaches its owner.
+        return trimmed.Any(character => char.IsControl(character) || char.GetUnicodeCategory(character) is
+            UnicodeCategory.Format or UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator)
+            ? null
+            : trimmed;
     }
 
     /// <summary>
@@ -335,13 +349,20 @@ public sealed class TokenStore : IDisposable
     /// It takes the lock it has no use for, because <see cref="Generate"/>
     /// takes it and the point of this method is to cost what that one costs.
     /// </remarks>
-    public void GenerateDummy()
+    /// <returns>
+    /// The token it did not store, so the caller can pay for a log write of
+    /// the same shape as the one the hit path makes. Never store or return
+    /// this to anyone.
+    /// </returns>
+    public string GenerateDummy()
     {
-        RawToken(out _, out _);
+        RawToken(out _, out var formatted);
 
         lock (_gate)
         {
         }
+
+        return formatted;
     }
 
     private static void RawToken(out string raw, out string formatted)
@@ -463,7 +484,14 @@ public sealed class TokenStore : IDisposable
         // way the host matches it, by the dictionary above.
         if (!FixedTimeEquals(candidate.Token, normalizedToken) || !string.Equals(candidate.IpAddress, ip, StringComparison.Ordinal))
         {
-            candidate.FailedAttempts++;
+            // Only the address the token is bound to can spend the account's
+            // ceiling. A guess from anywhere else cannot succeed whatever it
+            // contains - the binding above refuses it - so counting it bought
+            // no protection and let a stranger burn a victim's five attempts
+            // and deny them a reset for as long as the token lived. Guessing
+            // from elsewhere is still bounded, by that address's own budget.
+            if (string.Equals(candidate.IpAddress, ip, StringComparison.Ordinal))
+                candidate.FailedAttempts++;
             return TokenAttemptResult.Invalid;
         }
 
@@ -502,7 +530,7 @@ public sealed class TokenStore : IDisposable
     }
 
     private static string PendingKey(string ip, string username)
-        => $"{ip}\n{username.ToLowerInvariant()}";
+        => $"{ip}\n{username}";
 
     /// <summary>
     /// Whether a key has anything left in its window. Must be called under
