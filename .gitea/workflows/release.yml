@@ -1,0 +1,156 @@
+name: Release Build
+
+# The Gitea half of dual hosting (.github/workflows/release.yml is the
+# GitHub half). Both fire at the same tag, each builds its own archive
+# and each writes its own manifest naming its own copy, because the two
+# archives are not the same bytes: the assembly embeds the checkout path
+# and the zip embeds the mtimes, so one checksum cannot describe both.
+
+on:
+  release:
+    types: [published]
+
+env:
+  # This host's manifest lives on its own branch. `stable` is shared with
+  # GitHub, whose CI commits a manifest of GitHub URLs to it, so a second
+  # CI writing the same file on the same branch would fork it on the two
+  # remotes and every later push would be a non-fast-forward.
+  METADATA_BRANCH: metadata
+  MANIFEST_PATH: manifest.json
+  # Anything a user reads out of a manifest points at the CDN; anything
+  # that talks to Gitea goes to the origin. github.com is behind SSO,
+  # so a download URL naming it is not installable.
+  ASSET_BASE_URL: https://github.com/revam/dotnet-shoko-plugin-forgotten/releases
+  # The proxy in front of github.com answers 403 to any HTTP/2 request
+  # that streams a body, which is every push over 1 MiB. GIT_CONFIG_*
+  # reaches actions/checkout's own git, which a `git config` step would
+  # not. Remove when the proxy is fixed; it is not a property of this
+  # workflow.
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: http.version
+  GIT_CONFIG_VALUE_0: HTTP/1.1
+
+jobs:
+  build:
+    # Pinned. `ubuntu-latest` is a moving pointer, and 24.04 is the image
+    # that carries node24 - which the action pins below need, node20
+    # being end of life - along with zip, jq and curl.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # The image has no SDK. `global-json-file` rather than a literal
+      # version, so this cannot drift from what a developer builds with.
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Check the toolchain
+        run: |
+          for tool in dotnet zip jq curl git; do
+            command -v "$tool" >/dev/null 2>&1 || {
+              echo "runner image is missing: ${tool}" >&2
+              exit 1
+            }
+          done
+
+      - name: Fetch the live manifest
+        run: |
+          # checkout only sets up a remote-tracking ref for the branch it
+          # checked out, hence the explicit refspec.
+          #
+          # No fallback. The branch is seeded by hand once; falling back
+          # to the copy on `stable` would publish this host's manifest
+          # carrying GitHub's download URLs.
+          git fetch --no-tags origin "+refs/heads/${METADATA_BRANCH}:refs/remotes/origin/${METADATA_BRANCH}"
+          git show "origin/${METADATA_BRANCH}:${MANIFEST_PATH}" > "${RUNNER_TEMP}/manifest.json"
+
+      - name: Build
+        run: dotnet build Shoko.Plugin.Forgotten.slnx --configuration Release
+
+      - name: Package
+        run: |
+          ZIP_NAME="Shoko.Plugin.Forgotten-${{ github.event.release.tag_name }}-any.zip"
+          cd source/bin/Release/net10.0
+          zip "../../../../${ZIP_NAME}" Shoko.Plugin.Forgotten.dll
+          cd ../../../..
+          echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload to Release
+        env:
+          # Gitea has no GITHUB_TOKEN. The automatic token is GITEA_TOKEN,
+          # and it can write a release even though it cannot write a
+          # package registry.
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          scripts/gitea-release-asset.sh \
+            --tag "${{ github.event.release.tag_name }}" \
+            "${ZIP_NAME}"
+
+      - name: Update Manifest
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          SOURCE_REVISION=$(git rev-parse HEAD)
+          # Gitea's release event payload is not GitHub's, so the publish
+          # time is read back from the API rather than trusted from the
+          # event. A payload carrying neither timestamp falls back to
+          # now; an API call that fails stops the step.
+          RELEASED_AT=$(curl --silent --show-error --fail \
+            --header "Authorization: token ${GITEA_TOKEN}" \
+            --header "Accept: application/json" \
+            "${GITHUB_SERVER_URL%/}/api/v1/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+            | jq -r '.published_at // .created_at // empty')
+          RELEASED_AT="${RELEASED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+          CHECKSUM=$(sha256sum "${ZIP_NAME}" | awk '{ print $1 }')
+          URL="${ASSET_BASE_URL}/${TAG}/${ZIP_NAME}"
+
+          RELEASE_ENTRY=$(jq -n \
+            --arg version "$VERSION" \
+            --arg tag "$TAG" \
+            --arg source_revision "$SOURCE_REVISION" \
+            --arg released_at "$RELEASED_AT" \
+            --arg url "$URL" \
+            --arg checksum "$CHECKSUM" \
+            '{
+              version: $version,
+              tag: $tag,
+              source_revision: $source_revision,
+              released_at: $released_at,
+              channel: "Stable",
+              release_notes: null,
+              archives: [
+                {
+                  runtime: "any",
+                  abstraction: "6.0.0",
+                  url: $url,
+                  checksum: $checksum
+                }
+              ]
+            }')
+
+          jq --argjson release "$RELEASE_ENTRY" '
+            .releases |= [ $release ] + (. | map(select(.version != $release.version)))
+          ' "${RUNNER_TEMP}/manifest.json" > "${RUNNER_TEMP}/manifest.next.json"
+          mv "${RUNNER_TEMP}/manifest.next.json" "${RUNNER_TEMP}/manifest.json"
+
+          # The work tree has to be clean to switch branches, and the
+          # manifest travels in RUNNER_TEMP rather than in a stash: a
+          # stash of a path that already exists on the metadata branch
+          # conflicts on every apply.
+          git reset --hard
+          git checkout -B "${METADATA_BRANCH}" "origin/${METADATA_BRANCH}"
+          cp "${RUNNER_TEMP}/manifest.json" "${MANIFEST_PATH}"
+          git config user.name "gitea-actions[bot]"
+          git config user.email "gitea-actions[bot]@noreply.github.com"
+          git add "${MANIFEST_PATH}"
+          # The only commit and the only push, and it is not on a source
+          # branch, so `stable` stays byte-identical on both remotes.
+          git commit -m "ci: update manifest for ${TAG}"
+          git push origin "${METADATA_BRANCH}"
