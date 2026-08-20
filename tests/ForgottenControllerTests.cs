@@ -185,6 +185,29 @@ public class ForgottenControllerTests
     }
 
     /// <summary>
+    /// Not on anyone's list, but the same shape as the overlong one: the
+    /// host does not null-check the password it is handed, despite its own
+    /// documentation, and treats null as "leave it alone". A caller sending
+    /// null would have got a 200 saying the password was reset, with the
+    /// password unchanged and the token gone.
+    /// </summary>
+    [Fact]
+    public async Task A_null_password_is_refused_rather_than_silently_ignored()
+    {
+        var harness = NewHarness();
+        harness.Users.Add("admin");
+        var token = TokenFor(harness, "admin");
+
+        var result = await harness.Controller.ResetPassword(new() { Username = "admin", Token = token, NewPassword = null! });
+
+        Assert.Equal(400, StatusOf(result));
+        Assert.Equal(0, harness.Users.PasswordChanges);
+
+        var retry = await harness.Controller.ResetPassword(new() { Username = "admin", Token = token, NewPassword = "hunter2" });
+        Assert.Equal(200, StatusOf(retry));
+    }
+
+    /// <summary>
     /// The same property, for a failure this plugin cannot predict: if the
     /// host refuses for any reason, nothing changed, so the token was not
     /// really spent.
