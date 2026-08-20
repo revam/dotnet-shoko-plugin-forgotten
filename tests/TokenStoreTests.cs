@@ -350,4 +350,50 @@ public class TokenStoreTests
 
     private static string Guess(int seed)
         => seed.ToString("X12", System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// A lockout can only exist for an account that has a live token, so an
+    /// answer of "locked" is an answer of "this account exists and has a
+    /// reset in flight". It has to cost what a wrong guess costs, or it is a
+    /// free probe that can be repeated for ever.
+    /// </summary>
+    [Fact]
+    public void A_locked_token_costs_the_address_what_a_wrong_one_costs()
+    {
+        var (store, _) = NewStore();
+        Issue(store, "admin");
+
+        // Burn the account's ceiling, which also spends that many attempts.
+        for (var attempt = 0; attempt < TokenStore.MaxFailedAttemptsPerToken; attempt++)
+            Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", Guess(attempt), Ip, out _));
+
+        // Every further read of the locked state must draw down the same
+        // budget, so the address runs out rather than probing indefinitely.
+        var remaining = TokenStore.MaxVerifyAttemptsPerIp - TokenStore.MaxFailedAttemptsPerToken;
+        for (var attempt = 0; attempt < remaining; attempt++)
+            Assert.Equal(TokenAttemptResult.LockedOut, store.TryVerify("admin", Guess(99), Ip, out _));
+
+        Assert.Equal(TokenAttemptResult.RateLimited, store.TryVerify("admin", Guess(99), Ip, out _));
+    }
+
+    /// <summary>
+    /// The host's password write is not instant, and another address can
+    /// start its own reset during it. Once the password has actually
+    /// changed, every token the account had is stale - including that one.
+    /// </summary>
+    [Fact]
+    public void A_completed_reset_retires_a_token_issued_while_it_was_in_flight()
+    {
+        var (store, _) = NewStore();
+        var first = Issue(store, "admin");
+
+        Assert.Equal(TokenAttemptResult.Ok, store.TryConsume("admin", first, Ip, out var ticket, out _));
+
+        // A second address asks while the first reset is mid-flight.
+        var second = Issue(store, "admin", OtherIp);
+
+        ticket!.Commit();
+
+        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", second, OtherIp, out _));
+    }
 }

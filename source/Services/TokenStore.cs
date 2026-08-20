@@ -370,8 +370,11 @@ public sealed class TokenStore : IDisposable
 
             // A wrong answer costs the address one of its attempts; a right
             // one does not, so that verifying a token and then spending it
-            // is one attempt rather than two.
-            if (result is TokenAttemptResult.Invalid)
+            // is one attempt rather than two. A locked one costs the same as
+            // a wrong one - it is indistinguishable on the wire, and it must
+            // be indistinguishable in what it costs too, or it is a probe
+            // that can be repeated for ever.
+            if (result is TokenAttemptResult.Invalid or TokenAttemptResult.LockedOut)
                 TrySpend(_verifyAttempts, ip, MaxVerifyAttemptsPerIp, VerifyAttemptWindow, now, out _);
 
             return result;
@@ -477,8 +480,12 @@ public sealed class TokenStore : IDisposable
     {
         lock (_gate)
         {
-            if (_tokens.TryGetValue(entry.Username, out var current) && ReferenceEquals(current, entry))
-                _tokens.Remove(entry.Username);
+            // Unconditional, unlike Restore. The password has actually
+            // changed by the time this runs, so every token the account had
+            // outstanding is stale - including one issued from another
+            // address during the host's write, which the reference guard
+            // this used to carry would have left alive and spendable.
+            _tokens.Remove(entry.Username);
         }
     }
 

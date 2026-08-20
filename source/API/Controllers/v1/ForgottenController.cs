@@ -127,8 +127,13 @@ public class ForgottenController(
                 return RateLimited("Too many attempts. Please try again later.", nextAllowedAt);
 
             case TokenAttemptResult.LockedOut:
+                // Answered exactly as an unknown token is. A lockout can only
+                // exist for an account that has a live token, so reporting it
+                // separately told a stranger the account exists and has a
+                // reset in flight - which is the question every other line of
+                // this endpoint is written to refuse.
                 _logger.LogWarning("Token verification blocked — the token has taken too many failed attempts. Client IPs: {IPs}", ips);
-                return StatusCode(403, Failure("Token has been locked due to too many failed attempts."));
+                return Ok(new ForgottenResponse { Success = true, Valid = false });
 
             default:
                 return Ok(new ForgottenResponse { Success = true, Valid = result is TokenAttemptResult.Ok });
@@ -170,8 +175,10 @@ public class ForgottenController(
                 return RateLimited("Too many attempts. Please try again later.", nextAllowedAt);
 
             case TokenAttemptResult.LockedOut:
+                // Same answer as any other failure, for the reason in
+                // VerifyToken above.
                 _logger.LogWarning("Password reset blocked — the token has taken too many failed attempts. Client IPs: {IPs}", ips);
-                return StatusCode(403, Failure("Token has been locked due to too many failed attempts."));
+                return StatusCode(403, Failure("Invalid or expired token."));
 
             case not TokenAttemptResult.Ok:
                 _logger.LogWarning("Password reset failed — invalid or expired token, or address mismatch. Client IPs: {IPs}", ips);
