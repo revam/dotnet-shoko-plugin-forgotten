@@ -36,7 +36,7 @@ The plugin supports the following configuration options in your Shoko settings:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `TrustProxy` | `false` | When `true`, the plugin will read the `X-Forwarded-For` header to determine client IPs. Enable this only if Shoko is behind a trusted reverse proxy. When `false`, only the direct connection IP is used. |
+| `TrustProxy` | `false` | When `true`, the plugin will read the `X-Forwarded-For` header to determine client IPs. Enable this only if Shoko is behind a trusted reverse proxy. When `false`, only the direct connection IP is used. Only the rightmost entry is believed, and only if it parses as an address, so a caller cannot vary the chain to escape rate limiting. |
 
 ## Rate Limits
 

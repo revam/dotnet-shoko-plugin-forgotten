@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
+using System.Net;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
@@ -336,6 +337,19 @@ public class ForgottenController(
         });
     }
 
+    /// <summary>
+    /// The address every control here is keyed by: the rate limits, and the
+    /// address a reset token is bound to.
+    /// </summary>
+    /// <remarks>
+    /// Only the <em>rightmost</em> entry of <c>X-Forwarded-For</c> is taken,
+    /// and only if it parses as an address. Proxies append, so that entry is
+    /// the one our own proxy wrote and everything left of it is whatever the
+    /// caller chose to send. Trusting the whole chain let a caller vary the
+    /// prefix to mint a fresh rate-limit bucket per request — which here
+    /// meant unlimited reset-token guessing — and grew the limiter's
+    /// dictionaries on strings it had written itself.
+    /// </remarks>
     private bool TryGetClientIps([NotNullWhen(true)] out string? ips)
     {
         var remoteIp = HttpContext.Connection.RemoteIpAddress?.ToString();
@@ -345,13 +359,27 @@ public class ForgottenController(
             return false;
         }
 
-        var forwardedFor = _configurationProvider.Load().TrustProxy
-            ? Request.Headers["X-Forwarded-For"].FirstOrDefault()
-            : null;
-        if (!string.IsNullOrEmpty(forwardedFor))
-            ips = $"{forwardedFor} | direct: {remoteIp ?? "unknown"}";
-        else
-            ips = remoteIp;
+        ips = remoteIp;
+        if (!_configurationProvider.Load().TrustProxy)
+            return true;
+
+        // LastOrDefault, then the last entry within it: the header may arrive
+        // as several header lines as well as one comma-separated list.
+        if (RightmostForwardedAddress(Request.Headers["X-Forwarded-For"].LastOrDefault()) is { } client)
+            ips = $"{client} | direct: {remoteIp}";
         return true;
+    }
+
+    /// <summary>
+    /// The address our own proxy reported, or <c>null</c> when the header
+    /// carries nothing we are willing to believe.
+    /// </summary>
+    internal static string? RightmostForwardedAddress(string? headerValue)
+    {
+        if (string.IsNullOrEmpty(headerValue))
+            return null;
+
+        var rightmost = headerValue.AsSpan()[(headerValue.LastIndexOf(',') + 1)..].Trim();
+        return IPAddress.TryParse(rightmost, out var client) ? client.ToString() : null;
     }
 }
