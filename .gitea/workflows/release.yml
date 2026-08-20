@@ -72,6 +72,12 @@ jobs:
       - name: Build
         run: dotnet build Shoko.Plugin.Forgotten.slnx --configuration Release
 
+      # The suite is the only thing holding the rate limiting, the token
+      # lifecycle and the account-existence answers in place. A release that
+      # builds but does not pass them is the release nobody would notice.
+      - name: Test
+        run: dotnet test Shoko.Plugin.Forgotten.slnx --configuration Release --no-build
+
       - name: Package
         run: |
           ZIP_NAME="Shoko.Plugin.Forgotten-${{ github.event.release.tag_name }}-any.zip"

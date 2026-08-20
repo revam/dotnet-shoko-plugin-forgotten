@@ -1,5 +1,5 @@
 using System;
-using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
@@ -8,289 +8,340 @@ using System.Threading;
 namespace Shoko.Plugin.Forgotten.Services;
 
 /// <summary>
-/// Provides storage and management of password reset tokens with rate limiting and IP tracking.
+/// Every reset token the plugin has issued, and every rate limit that
+/// governs issuing and spending them.
 /// </summary>
-public class TokenStore : IDisposable
+/// <remarks>
+/// <para>
+/// All mutable state here is guarded by one lock, and every operation the
+/// controller can reach is a single call that both decides and records.
+/// That is deliberate. The predecessor exposed each limit as a
+/// <c>Can…</c> predicate followed by a separate <c>Record…</c>, so two
+/// requests arriving together both passed a check neither had yet paid
+/// for — and the predicates themselves rewrote the window, so one of them
+/// silently discarded the other's increment. A limiter that can be raced
+/// is not a limiter.
+/// </para>
+/// <para>
+/// A lock rather than lock-free counters because the thing being protected
+/// spans several fields — a window start, its count, and the live token —
+/// and because the traffic this sees is measured in requests per day. There
+/// is no throughput to trade away.
+/// </para>
+/// <para>
+/// Tokens are keyed by <em>username</em>, not by token. Two consequences
+/// follow, and both are wanted: a user has at most one live token, so
+/// issuing a new one retires the old, and consuming one leaves nothing else
+/// armed; and a failed guess is counted against the account it was aimed at
+/// rather than against the string the guesser invented, which is what makes
+/// the per-token ceiling bind at all and what stops the bookkeeping growing
+/// on attacker-chosen keys.
+/// </para>
+/// </remarks>
+public sealed class TokenStore : IDisposable
 {
-    private readonly ConcurrentDictionary<string, TokenEntry> _tokens = new();
+    /// <summary>How long an issued token stays spendable.</summary>
+    public static readonly TimeSpan TokenExpiry = TimeSpan.FromMinutes(15);
 
-    // Global username request tracking
-    private DateTimeOffset _lastUsernameRequest = DateTimeOffset.MinValue;
-    private static readonly TimeSpan UsernameRequestCooldown = TimeSpan.FromHours(24);
+    /// <summary>The global cooldown between username dumps.</summary>
+    public static readonly TimeSpan UsernameRequestCooldown = TimeSpan.FromHours(24);
 
-    // Per-IP reset request tracking
-    private readonly ConcurrentDictionary<string, ResetRequestEntry> _resetRequests = new();
-    private static readonly int MaxResetRequestsPerIp = 5;
-    private static readonly TimeSpan ResetRequestWindow = TimeSpan.FromDays(1);
+    /// <summary>The window over which reset requests are counted per address.</summary>
+    public static readonly TimeSpan ResetRequestWindow = TimeSpan.FromDays(1);
 
-    // Per-IP verify/reset attempt tracking (same 24h window as reset requests)
-    private readonly ConcurrentDictionary<string, VerifyAttemptEntry> _verifyAttempts = new();
-    private static readonly int MaxVerifyAttemptsPerIp = 10;
-    private static readonly TimeSpan VerifyAttemptWindow = TimeSpan.FromDays(1);
+    /// <summary>The window over which verify and reset attempts are counted per address.</summary>
+    public static readonly TimeSpan VerifyAttemptWindow = TimeSpan.FromDays(1);
 
-    // Per-token failed attempt tracking
-    private readonly ConcurrentDictionary<string, TokenAttemptEntry> _tokenAttempts = new();
-    private static readonly int MaxFailedAttemptsPerToken = 5;
+    /// <summary>Reset tokens one address may ask for per <see cref="ResetRequestWindow"/>.</summary>
+    public const int MaxResetRequestsPerIp = 5;
 
-    private static readonly TimeSpan TokenExpiry = TimeSpan.FromMinutes(15);
-    private const int TokenLength = 12;
-    private const int MaxInputLength = 23; // 12 chars + 11 dashes/spaces
+    /// <summary>Token attempts one address may spend per <see cref="VerifyAttemptWindow"/>.</summary>
+    public const int MaxVerifyAttemptsPerIp = 10;
 
-    private readonly Timer _cleanupTimer;
+    /// <summary>Wrong tokens an account will tolerate before its live token is retired.</summary>
+    public const int MaxFailedAttemptsPerToken = 5;
 
     /// <summary>
-    /// Initializes a new instance of the <see cref="TokenStore"/> class and starts the background cleanup timer.
+    /// The longest password the host will accept. Shoko's user update
+    /// rejects anything longer with a validation exception, so the check
+    /// lives here too: it has to happen <em>before</em> a token is spent,
+    /// or a typo-length paste costs the user their only token and returns
+    /// them a 500.
     /// </summary>
-    public TokenStore()
+    public const int MaxPasswordLength = 1024;
+
+    /// <summary>
+    /// The longest username accepted on the wire.
+    ///
+    /// The host imposes no limit of its own, so this one is this plugin's
+    /// and is set generously: it exists to bound what gets written into a
+    /// log line and used as a dictionary key, not to have an opinion about
+    /// what a username may be.
+    /// </summary>
+    public const int MaxUsernameLength = 256;
+
+    private const int TokenLength = 12;
+
+    /// <summary>Twelve characters, plus room for the separators a person types.</summary>
+    private const int MaxTokenInputLength = 23;
+
+    /// <summary>
+    /// Keyed the way the host resolves a username, so that the account the
+    /// token was issued for and the account the submitter names are the same
+    /// account under the same rule.
+    /// </summary>
+    private readonly Dictionary<string, TokenEntry> _tokens = new(StringComparer.InvariantCultureIgnoreCase);
+
+    private readonly Dictionary<string, WindowEntry> _resetRequests = new(StringComparer.Ordinal);
+
+    private readonly Dictionary<string, WindowEntry> _verifyAttempts = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// One entry per reset asked for from an address for an account, whether
+    /// or not that account exists.
+    /// </summary>
+    /// <remarks>
+    /// It is written on the miss as well as the hit on purpose. The
+    /// one-request-at-a-time rule cannot be answered from
+    /// <see cref="_tokens"/>, because a nonexistent account has no token —
+    /// so a second request would be refused for a real user and allowed for
+    /// an invented one, and the difference between 429 and 200 is a
+    /// perfectly good way to enumerate accounts.
+    /// </remarks>
+    private readonly Dictionary<string, DateTimeOffset> _pendingRequests = new(StringComparer.Ordinal);
+
+    private readonly Lock _gate = new();
+
+    private readonly TimeProvider _timeProvider;
+
+    private readonly ITimer _cleanupTimer;
+
+    private DateTimeOffset _lastUsernameRequest = DateTimeOffset.MinValue;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="TokenStore"/> class and
+    /// starts the background sweep.
+    /// </summary>
+    /// <param name="timeProvider">
+    /// The clock. Every expiry and every window boundary is decided against
+    /// this at read time rather than by the sweep, so the sweep is only ever
+    /// reclaiming memory — if it stopped, nothing here would outlive its
+    /// stated lifetime.
+    /// </param>
+    public TokenStore(TimeProvider? timeProvider = null)
     {
-        _cleanupTimer = new Timer(_ => RunCleanup(), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _cleanupTimer = _timeProvider.CreateTimer(_ => RunCleanup(), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
     }
 
     /// <summary>
-    /// Disposes the background cleanup timer.
+    /// Disposes the background sweep timer.
     /// </summary>
     public void Dispose()
-    {
-        _cleanupTimer.Dispose();
-    }
+        => _cleanupTimer.Dispose();
 
-    private void RunCleanup()
+    private DateTimeOffset Now => _timeProvider.GetUtcNow();
+
+    /// <summary>
+    /// Reduces a username to the form this plugin will store, compare and
+    /// log, or <c>null</c> when it could not be a username.
+    /// </summary>
+    /// <remarks>
+    /// Control characters are refused rather than stripped. The console log
+    /// is this plugin's delivery channel for reset tokens and its layout is
+    /// a plain one-line rendering of the message, so a username carrying a
+    /// newline can write a second line that reads exactly like a token line
+    /// for somebody else's account. Refusing is also the honest answer: a
+    /// client sending one is not naming a user that could exist.
+    /// </remarks>
+    /// <param name="username">The username as submitted.</param>
+    /// <returns>The trimmed username, or <c>null</c>.</returns>
+    public static string? NormalizeUsername(string? username)
     {
-        CleanupTokens();
-        CleanupResetRequests();
-        CleanupVerifyAttempts();
-        CleanupTokenAttempts();
+        if (username is null)
+            return null;
+
+        var trimmed = username.Trim();
+        if (trimmed.Length is 0 || trimmed.Length > MaxUsernameLength)
+            return null;
+
+        return trimmed.Any(char.IsControl) ? null : trimmed;
     }
 
     /// <summary>
-    /// Checks if username requests are allowed (global 24h cooldown).
+    /// Reduces a token to the form it is stored in — twelve uppercase hex
+    /// characters — or <c>null</c> when it could not be one of ours.
     /// </summary>
-    /// <param name="nextAllowedAt">When set, contains the timestamp when the next request will be allowed.</param>
-    /// <returns><c>true</c> if the request is allowed; otherwise, <c>false</c>.</returns>
-    public bool CanRequestUsernames(out DateTimeOffset? nextAllowedAt)
+    /// <remarks>
+    /// This is the only statement of what a token may look like. It used to
+    /// have a twin, <c>IsValidTokenFormat</c>, that restated the same rules
+    /// for the controller's benefit; two copies of one rule set is one copy
+    /// too many, so the controller now asks this and keeps the answer.
+    /// </remarks>
+    /// <param name="token">The token as submitted, with or without separators.</param>
+    /// <returns>The normalized token, or <c>null</c>.</returns>
+    public static string? NormalizeToken(string? token)
     {
-        var nextAllowed = _lastUsernameRequest + UsernameRequestCooldown;
-        if (DateTimeOffset.UtcNow < nextAllowed)
+        if (token is null || token.Length > MaxTokenInputLength)
+            return null;
+
+        var builder = new StringBuilder(TokenLength);
+        foreach (var character in token)
         {
-            nextAllowedAt = nextAllowed;
-            return false;
-        }
-
-        nextAllowedAt = null;
-        return true;
-    }
-
-    /// <summary>
-    /// Records that a username request was made.
-    /// </summary>
-    public void RecordUsernameRequest()
-    {
-        _lastUsernameRequest = DateTimeOffset.UtcNow;
-    }
-
-    /// <summary>
-    /// Checks if a reset request is allowed for the given IP.
-    /// </summary>
-    /// <param name="ip">The client IP address.</param>
-    /// <param name="username">The username being requested.</param>
-    /// <param name="nextAllowedAt">When set, contains the timestamp when the next request will be allowed.</param>
-    /// <returns><c>true</c> if the request is allowed; otherwise, <c>false</c>.</returns>
-    public bool CanRequestReset(string ip, string username, out DateTimeOffset? nextAllowedAt)
-    {
-        nextAllowedAt = null;
-
-        // Check if IP has reached daily limit
-        if (_resetRequests.TryGetValue(ip, out var entry))
-        {
-            // Check if we're in a new window
-            if (DateTimeOffset.UtcNow - entry.WindowStart >= ResetRequestWindow)
-            {
-                // Reset the window
-                entry = new ResetRequestEntry { WindowStart = DateTimeOffset.UtcNow };
-                _resetRequests[ip] = entry;
-            }
-
-            if (entry.Count >= MaxResetRequestsPerIp)
-            {
-                nextAllowedAt = entry.WindowStart + ResetRequestWindow;
-                return false;
-            }
-
-        // Check for concurrent request for same username+IP
-        if (entry.TryGetPendingRequestTime(username, out var requestTime))
-        {
-            // Check if the pending token has expired
-            var tokenExpiry = requestTime + TokenExpiry;
-            if (DateTimeOffset.UtcNow >= tokenExpiry)
-            {
-                // Token has expired, allow retry
-                entry.RemovePendingUsername(username);
-            }
-            else
-            {
-                nextAllowedAt = tokenExpiry;
-                return false;
-            }
-        }
-        }
-
-        return true;
-    }
-
-    /// <summary>
-    /// Records that a reset request was made for tracking purposes.
-    /// </summary>
-    /// <param name="ip">The client IP address.</param>
-    /// <param name="username">The username being requested.</param>
-    public void RecordResetRequest(string ip, string username)
-    {
-        var entry = _resetRequests.AddOrUpdate(ip,
-            _ => new ResetRequestEntry
-            {
-                WindowStart = DateTimeOffset.UtcNow,
-                Count = 1
-            },
-            (_, existing) =>
-            {
-                existing.IncrementCount();
-                return existing;
-            });
-
-        entry.AddPendingUsername(username);
-    }
-
-    /// <summary>
-    /// Checks if verify/reset attempts are allowed for the given IP.
-    /// </summary>
-    /// <param name="ip">The client IP address.</param>
-    /// <param name="nextAllowedAt">When set, contains the timestamp when attempts will be allowed again.</param>
-    /// <returns><c>true</c> if attempts are allowed; otherwise, <c>false</c>.</returns>
-    public bool CanAttemptVerify(string ip, out DateTimeOffset? nextAllowedAt)
-    {
-        nextAllowedAt = null;
-
-        if (_verifyAttempts.TryGetValue(ip, out var entry))
-        {
-            // Check if we're in a new window
-            if (DateTimeOffset.UtcNow - entry.WindowStart >= VerifyAttemptWindow)
-            {
-                // Reset the window
-                entry = new VerifyAttemptEntry { WindowStart = DateTimeOffset.UtcNow };
-                _verifyAttempts[ip] = entry;
-            }
-
-            if (entry.Count >= MaxVerifyAttemptsPerIp)
-            {
-                nextAllowedAt = entry.WindowStart + VerifyAttemptWindow;
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    /// <summary>
-    /// Records a verify/reset attempt for rate limiting.
-    /// </summary>
-    /// <param name="ip">The client IP address.</param>
-    public void RecordVerifyAttempt(string ip)
-    {
-        _verifyAttempts.AddOrUpdate(ip,
-            _ => new VerifyAttemptEntry
-            {
-                WindowStart = DateTimeOffset.UtcNow,
-                Count = 1
-            },
-            (_, existing) =>
-            {
-                existing.IncrementCount();
-                return existing;
-            });
-    }
-
-    /// <summary>
-    /// Validates the token format without checking if it exists.
-    /// </summary>
-    /// <param name="token">The token to validate.</param>
-    /// <returns><c>true</c> if the token format is valid (12 hex chars after normalization); otherwise, <c>false</c>.</returns>
-    public bool IsValidTokenFormat(string token)
-    {
-        if (token.Length > MaxInputLength)
-            return false;
-        
-        var digitCount = 0;
-        foreach (var c in token)
-        {
-            if (c is '-' or ' ')
+            if (character is '-' or ' ')
                 continue;
-            
-            if (!char.IsAsciiHexDigit(c))
-                return false;
-            
-            digitCount++;
+
+            if (!char.IsAsciiHexDigit(character) || builder.Length == TokenLength)
+                return null;
+
+            builder.Append(char.ToUpperInvariant(character));
         }
-        
-        return digitCount == TokenLength;
+
+        return builder.Length == TokenLength ? builder.ToString() : null;
     }
 
     /// <summary>
-    /// Checks if a token has exceeded its maximum failed attempts.
+    /// Decides whether a password will be accepted before any token is
+    /// spent on it.
     /// </summary>
-    /// <param name="normalizedToken">The normalized token.</param>
-    /// <returns><c>true</c> if the token is locked out; otherwise, <c>false</c>.</returns>
-    public bool IsTokenLockedOut(string normalizedToken)
-    {
-        return _tokenAttempts.TryGetValue(normalizedToken, out var entry) && entry.FailedCount >= MaxFailedAttemptsPerToken;
-    }
+    /// <remarks>
+    /// Empty is valid. Shoko supports passwordless accounts on purpose and
+    /// this endpoint is not the place to overrule that.
+    /// </remarks>
+    /// <param name="password">The proposed password.</param>
+    /// <returns><c>true</c> when the host will accept it.</returns>
+    public static bool IsAcceptablePassword(string? password)
+        => password is not null && password.Length <= MaxPasswordLength;
 
     /// <summary>
-    /// Records a failed attempt for a token.
+    /// Takes the global username-dump budget, if it is there to take.
     /// </summary>
-    /// <param name="normalizedToken">The normalized token.</param>
-    public void RecordFailedTokenAttempt(string normalizedToken)
+    /// <param name="nextAllowedAt">When refused, when the next dump is due.</param>
+    /// <returns><c>true</c> when the caller may proceed.</returns>
+    public bool TryRecordUsernameRequest(out DateTimeOffset? nextAllowedAt)
     {
-        _tokenAttempts.AddOrUpdate(normalizedToken,
-            _ => new TokenAttemptEntry { LastAttempt = DateTimeOffset.UtcNow, FailedCount = 1 },
-            (_, existing) =>
+        lock (_gate)
+        {
+            var now = Now;
+            var nextAllowed = _lastUsernameRequest + UsernameRequestCooldown;
+            if (now < nextAllowed)
             {
-                existing.LastAttempt = DateTimeOffset.UtcNow;
-                existing.FailedCount++;
-                return existing;
-            });
+                nextAllowedAt = nextAllowed;
+                return false;
+            }
+
+            _lastUsernameRequest = now;
+            nextAllowedAt = null;
+            return true;
+        }
     }
 
     /// <summary>
-    /// Generates a new reset token for the specified username and IP.
+    /// Reports whether an address has spent its whole attempt budget.
     /// </summary>
-    /// <param name="username">The username for which to generate the token.</param>
-    /// <param name="ip">The client IP address.</param>
-    /// <returns>The generated token string in formatted form (XXXX-XXXX-XXXX).</returns>
+    /// <remarks>
+    /// This reads without spending, and is used by the endpoints that are
+    /// gated by the attempt budget without being attempts themselves. It is
+    /// a check with no matching act, so there is nothing here to race.
+    /// </remarks>
+    /// <param name="ip">The client address.</param>
+    /// <param name="nextAllowedAt">When exhausted, when the window rolls over.</param>
+    /// <returns><c>true</c> when the address has nothing left to spend.</returns>
+    public bool IsAttemptBudgetExhausted(string ip, out DateTimeOffset? nextAllowedAt)
+    {
+        lock (_gate)
+            return !HasBudget(_verifyAttempts, ip, MaxVerifyAttemptsPerIp, VerifyAttemptWindow, Now, out nextAllowedAt);
+    }
+
+    /// <summary>
+    /// Claims the right to ask for a reset token for an account.
+    /// </summary>
+    /// <remarks>
+    /// The per-address daily budget is taken here, atomically, and only when
+    /// the request is going to be allowed. The caller then asks the host
+    /// whether the account exists and calls <see cref="Generate"/> or
+    /// <see cref="GenerateDummy"/>; that lookup is a host round-trip and is
+    /// deliberately not held under this lock. Two requests that slip between
+    /// the claim and the mint can therefore both mint — but the second
+    /// replaces the first, so the user still ends up with exactly one live
+    /// token, and both paid for their slot.
+    /// </remarks>
+    /// <param name="username">The normalized username.</param>
+    /// <param name="ip">The client address.</param>
+    /// <param name="nextAllowedAt">When refused, when the caller may try again.</param>
+    /// <returns>Why the request was refused, or <see cref="ResetRequestResult.Ok"/>.</returns>
+    public ResetRequestResult TryStartReset(string username, string ip, out DateTimeOffset? nextAllowedAt)
+    {
+        lock (_gate)
+        {
+            var now = Now;
+
+            // An address that has burned its attempt budget is not allowed to
+            // mint fresh material either; this reads the budget without
+            // spending it, because asking for a token is not an attempt.
+            if (!HasBudget(_verifyAttempts, ip, MaxVerifyAttemptsPerIp, VerifyAttemptWindow, now, out nextAllowedAt))
+                return ResetRequestResult.AttemptsExhausted;
+
+            // One request per account and address at a time: a second while
+            // the first is still good is far more likely to be a resend than
+            // a person who lost the token.
+            var pendingKey = PendingKey(ip, username);
+            if (_pendingRequests.TryGetValue(pendingKey, out var pendingUntil) && now < pendingUntil)
+            {
+                nextAllowedAt = pendingUntil;
+                return ResetRequestResult.AlreadyPending;
+            }
+
+            if (!TrySpend(_resetRequests, ip, MaxResetRequestsPerIp, ResetRequestWindow, now, out nextAllowedAt))
+                return ResetRequestResult.RateLimited;
+
+            _pendingRequests[pendingKey] = now + TokenExpiry;
+            return ResetRequestResult.Ok;
+        }
+    }
+
+    /// <summary>
+    /// Issues a reset token for an account, retiring any token that account
+    /// already held.
+    /// </summary>
+    /// <param name="username">The normalized username.</param>
+    /// <param name="ip">The client address the token is bound to.</param>
+    /// <returns>The token in the form it is shown, <c>XXXX-XXXX-XXXX</c>.</returns>
     public string Generate(string username, string ip)
     {
-        // Generate 12-char hex token
         RawToken(out var rawToken, out var formattedToken);
-        
-        var entry = new TokenEntry
+
+        lock (_gate)
         {
-            Token = rawToken, // Store raw uppercase version
-            Username = username,
-            IpAddress = ip,
-            CreatedAt = DateTimeOffset.UtcNow,
-            ExpiresAt = DateTimeOffset.UtcNow + TokenExpiry
-        };
-        _tokens[rawToken] = entry;
+            var now = Now;
+            _tokens[username] = new TokenEntry
+            {
+                Token = rawToken,
+                Username = username,
+                IpAddress = ip,
+                ExpiresAt = now + TokenExpiry,
+            };
+        }
+
         return formattedToken;
     }
 
     /// <summary>
-    /// Performs the same work as <see cref="Generate"/> without storing a token.
-    /// This exists to prevent timing-based username enumeration — call this when the user
-    /// doesn't exist so both code paths take indistinguishable time.
+    /// Performs the same work as <see cref="Generate"/> without storing a
+    /// token. This exists to prevent timing-based username enumeration —
+    /// call it when the user does not exist so both paths cost the same.
     /// </summary>
+    /// <remarks>
+    /// It takes the lock it has no use for, because <see cref="Generate"/>
+    /// takes it and the point of this method is to cost what that one costs.
+    /// </remarks>
     public void GenerateDummy()
     {
-        // Must match Generate() exactly — same entropy generation and formatting
         RawToken(out _, out _);
+
+        lock (_gate)
+        {
+        }
     }
 
     private static void RawToken(out string raw, out string formatted)
@@ -300,252 +351,296 @@ public class TokenStore : IDisposable
     }
 
     /// <summary>
-    /// Verifies if a token is valid for the specified username and IP.
+    /// Checks a token against an account without spending it.
     /// </summary>
-    /// <param name="username">The username to verify against.</param>
-    /// <param name="token">The token to verify (can be formatted with dashes/spaces).</param>
-    /// <param name="ip">The client IP address.</param>
-    /// <param name="isValid">When this method returns, contains <c>true</c> if the token is valid; otherwise, <c>false</c>.</param>
-    /// <returns><c>true</c> if the attempt was allowed; <c>false</c> if rate limited or token locked out.</returns>
-    public bool TryVerify(string username, string token, string ip, out bool isValid)
+    /// <param name="username">The username as submitted.</param>
+    /// <param name="token">The token as submitted.</param>
+    /// <param name="ip">The client address.</param>
+    /// <param name="nextAllowedAt">When rate limited, when the window rolls over.</param>
+    /// <returns>The outcome, in enough detail for the caller to answer honestly.</returns>
+    public TokenAttemptResult TryVerify(string username, string token, string ip, out DateTimeOffset? nextAllowedAt)
     {
-        isValid = false;
-
-        var normalizedToken = NormalizeToken(token);
-        if (normalizedToken is null)
-            return false;
-
-        // Check if token is locked out due to too many failed attempts
-        if (IsTokenLockedOut(normalizedToken))
-            return false;
-
-        
-        if (!_tokens.TryGetValue(normalizedToken, out var entry))
+        lock (_gate)
         {
-            RecordFailedTokenAttempt(normalizedToken);
-            return true; // Allowed attempt, but invalid
+            var now = Now;
+            if (!HasBudget(_verifyAttempts, ip, MaxVerifyAttemptsPerIp, VerifyAttemptWindow, now, out nextAllowedAt))
+                return TokenAttemptResult.RateLimited;
+
+            var result = Check(username, token, ip, out nextAllowedAt, out _);
+
+            // A wrong answer costs the address one of its attempts; a right
+            // one does not, so that verifying a token and then spending it
+            // is one attempt rather than two. A locked one costs the same as
+            // a wrong one - it is indistinguishable on the wire, and it must
+            // be indistinguishable in what it costs too, or it is a probe
+            // that can be repeated for ever.
+            if (result is TokenAttemptResult.Invalid or TokenAttemptResult.LockedOut)
+                TrySpend(_verifyAttempts, ip, MaxVerifyAttemptsPerIp, VerifyAttemptWindow, now, out _);
+
+            return result;
         }
-        
-        // Validate username (constant-time) and IP (normal comparison)
-        if (!ConstantTimeEquals(entry.Username, username) || entry.IpAddress != ip)
+    }
+
+    /// <summary>
+    /// Checks a token against an account and, if it holds, spends it.
+    /// </summary>
+    /// <remarks>
+    /// A spent token is not yet a finished reset: the host still has to
+    /// accept the new password. The caller gets a <see cref="ResetTicket"/>
+    /// and owes it either a <see cref="ResetTicket.Commit"/> — which retires
+    /// the account's tokens for good — or a
+    /// <see cref="ResetTicket.Restore"/>, which puts this one back because
+    /// nothing was actually changed. Without that, a host that refuses the
+    /// password leaves the user with no token and no reset.
+    /// </remarks>
+    /// <param name="username">The username as submitted.</param>
+    /// <param name="token">The token as submitted.</param>
+    /// <param name="ip">The client address.</param>
+    /// <param name="ticket">The claim on the spent token, when the outcome is <see cref="TokenAttemptResult.Ok"/>.</param>
+    /// <param name="nextAllowedAt">When rate limited, when the window rolls over.</param>
+    /// <returns>The outcome.</returns>
+    public TokenAttemptResult TryConsume(string username, string token, string ip, out ResetTicket? ticket, out DateTimeOffset? nextAllowedAt)
+    {
+        ticket = null;
+        lock (_gate)
         {
-            RecordFailedTokenAttempt(normalizedToken);
-            return true; // Allowed attempt, but invalid
+            var now = Now;
+
+            // Unlike verification, spending always costs an attempt: this is
+            // the endpoint that changes something, and a caller that reaches
+            // it has committed to a guess either way.
+            if (!TrySpend(_verifyAttempts, ip, MaxVerifyAttemptsPerIp, VerifyAttemptWindow, now, out nextAllowedAt))
+                return TokenAttemptResult.RateLimited;
+
+            var result = Check(username, token, ip, out _, out var entry);
+            if (result is not TokenAttemptResult.Ok)
+                return result;
+
+            entry!.IsConsumed = true;
+            ticket = new ResetTicket(this, entry);
+            return TokenAttemptResult.Ok;
         }
-        
-        isValid = !entry.IsConsumed;
+    }
+
+    /// <summary>
+    /// The single statement of what makes a submitted token good. Must be
+    /// called under <see cref="_gate"/>.
+    /// </summary>
+    private TokenAttemptResult Check(string username, string token, string ip, out DateTimeOffset? nextAllowedAt, out TokenEntry? entry)
+    {
+        nextAllowedAt = null;
+        entry = null;
+
+        if (NormalizeUsername(username) is not { } normalizedUsername)
+            return TokenAttemptResult.Malformed;
+
+        if (NormalizeToken(token) is not { } normalizedToken)
+            return TokenAttemptResult.Malformed;
+
+        var now = Now;
+        if (!_tokens.TryGetValue(normalizedUsername, out var candidate))
+            return TokenAttemptResult.Invalid;
+
+        // Expiry is decided here, not by the sweep. The sweep runs on a
+        // timer nobody supervises; this runs on the request that would
+        // otherwise benefit from it having failed.
+        if (now >= candidate.ExpiresAt)
+        {
+            _tokens.Remove(normalizedUsername);
+            return TokenAttemptResult.Invalid;
+        }
+
+        if (candidate.FailedAttempts >= MaxFailedAttemptsPerToken)
+        {
+            nextAllowedAt = candidate.ExpiresAt;
+            return TokenAttemptResult.LockedOut;
+        }
+
+        // The token is the secret, so it is compared without leaking where
+        // it first differed. The username is not a secret — the host itself
+        // resolves it case-insensitively and this endpoint exists precisely
+        // for people who are guessing at their own — so it is matched the
+        // way the host matches it, by the dictionary above.
+        if (!FixedTimeEquals(candidate.Token, normalizedToken) || !string.Equals(candidate.IpAddress, ip, StringComparison.Ordinal))
+        {
+            candidate.FailedAttempts++;
+            return TokenAttemptResult.Invalid;
+        }
+
+        // Already spent is not a wrong guess, so it does not count against
+        // the account's ceiling; it is just nothing left to spend.
+        if (candidate.IsConsumed)
+            return TokenAttemptResult.Invalid;
+
+        entry = candidate;
+        return TokenAttemptResult.Ok;
+    }
+
+    private void CommitTicket(TokenEntry entry)
+    {
+        lock (_gate)
+        {
+            // Unconditional, unlike Restore. The password has actually
+            // changed by the time this runs, so every token the account had
+            // outstanding is stale - including one issued from another
+            // address during the host's write, which the reference guard
+            // this used to carry would have left alive and spendable.
+            _tokens.Remove(entry.Username);
+        }
+    }
+
+    private void RestoreTicket(TokenEntry entry)
+    {
+        lock (_gate)
+        {
+            // Only the entry that is still the account's live token may be
+            // put back. If a newer one has since been issued, the newer one
+            // is the one the user is holding and this must not displace it.
+            if (_tokens.TryGetValue(entry.Username, out var current) && ReferenceEquals(current, entry))
+                entry.IsConsumed = false;
+        }
+    }
+
+    private static string PendingKey(string ip, string username)
+        => $"{ip}\n{username.ToLowerInvariant()}";
+
+    /// <summary>
+    /// Whether a key has anything left in its window. Must be called under
+    /// <see cref="_gate"/>.
+    /// </summary>
+    private static bool HasBudget(Dictionary<string, WindowEntry> counters, string key, int limit, TimeSpan window, DateTimeOffset now, out DateTimeOffset? nextAllowedAt)
+    {
+        nextAllowedAt = null;
+        if (!counters.TryGetValue(key, out var entry) || now - entry.WindowStart >= window || entry.Count < limit)
+            return true;
+
+        nextAllowedAt = entry.WindowStart + window;
+        return false;
+    }
+
+    /// <summary>
+    /// Takes one from a key's window if there is one to take, and says so.
+    /// Nothing is recorded when the answer is no. Must be called under
+    /// <see cref="_gate"/>.
+    /// </summary>
+    private static bool TrySpend(Dictionary<string, WindowEntry> counters, string key, int limit, TimeSpan window, DateTimeOffset now, out DateTimeOffset? nextAllowedAt)
+    {
+        nextAllowedAt = null;
+
+        if (!counters.TryGetValue(key, out var entry) || now - entry.WindowStart >= window)
+        {
+            counters[key] = new WindowEntry(now);
+            return true;
+        }
+
+        if (entry.Count >= limit)
+        {
+            nextAllowedAt = entry.WindowStart + window;
+            return false;
+        }
+
+        entry.Count++;
         return true;
     }
 
     /// <summary>
-    /// Consumes a token, marking it as used.
+    /// Compares two equal-length strings without revealing where they first
+    /// differ.
     /// </summary>
-    /// <param name="username">The username to verify against.</param>
-    /// <param name="token">The token to consume (can be formatted with dashes/spaces).</param>
-    /// <param name="ip">The client IP address.</param>
-    /// <param name="consumed">When this method returns, contains <c>true</c> if the token was consumed; otherwise, <c>false</c>.</param>
-    /// <returns><c>true</c> if the attempt was allowed; <c>false</c> if rate limited or token locked out.</returns>
-    public bool TryConsume(string username, string token, string ip, out bool consumed)
-    {
-        consumed = false;
-
-        var normalizedToken = NormalizeToken(token);
-        if (normalizedToken is null)
-            return false;
-
-        // Check if token is locked out due to too many failed attempts
-        if (IsTokenLockedOut(normalizedToken))
-            return false;
-
-        
-        if (!_tokens.TryGetValue(normalizedToken, out var entry))
-        {
-            RecordFailedTokenAttempt(normalizedToken);
-            return true; // Allowed attempt, but invalid
-        }
-        
-        // Validate username (constant-time) and IP (normal comparison)
-        if (!ConstantTimeEquals(entry.Username, username) || entry.IpAddress != ip)
-        {
-            RecordFailedTokenAttempt(normalizedToken);
-            return true; // Allowed attempt, but invalid
-        }
-        
-        consumed = entry.TryConsume();
-        return true;
-    }
-
-    /// <summary>
-    /// Normalizes a token input by removing dashes and spaces, converting to uppercase,
-    /// and validating length.
-    /// </summary>
-    /// <param name="token">The token input.</param>
-    /// <returns>The normalized token, or null if invalid.</returns>
-    private static string? NormalizeToken(string token)
-    {
-        if (token.Length > MaxInputLength)
-            return null;
-        
-        // Remove dashes and spaces, convert to uppercase
-        var sb = new StringBuilder(TokenLength);
-        foreach (var c in token)
-        {
-            if (c is '-' or ' ')
-                continue;
-            
-            if (!char.IsAsciiHexDigit(c))
-                return null;
-            
-            sb.Append(char.ToUpperInvariant(c));
-        }
-        
-        return sb.Length == TokenLength ? sb.ToString() : null;
-    }
-
-    /// <summary>
-    /// Performs a constant-time comparison of two strings to prevent timing attacks.
-    /// </summary>
-    private static bool ConstantTimeEquals(string a, string b)
+    private static bool FixedTimeEquals(string a, string b)
     {
         if (a.Length != b.Length)
             return false;
-        
+
         var result = 0;
-        for (var i = 0; i < a.Length; i++)
-        {
-            result |= a[i] ^ b[i];
-        }
-        
+        for (var index = 0; index < a.Length; index++)
+            result |= a[index] ^ b[index];
+
         return result == 0;
     }
 
-    private void CleanupTokens()
+    /// <summary>
+    /// Drops state nothing can consult any more. Purely a memory sweep —
+    /// every decision above is already made against the clock, so a sweep
+    /// that never ran would cost memory and nothing else.
+    /// </summary>
+    internal void RunCleanup()
     {
-        var cutoff = DateTimeOffset.UtcNow - TokenExpiry;
-        var keysToRemove = _tokens
-            .Where(kvp => kvp.Value.CreatedAt < cutoff)
-            .Select(kvp => kvp.Key)
-            .ToArray();
-
-        foreach (var key in keysToRemove)
+        lock (_gate)
         {
-            _tokens.TryRemove(key, out _);
+            var now = Now;
+
+            foreach (var key in _tokens.Where(pair => now >= pair.Value.ExpiresAt).Select(pair => pair.Key).ToArray())
+                _tokens.Remove(key);
+
+            foreach (var key in _resetRequests.Where(pair => now - pair.Value.WindowStart >= ResetRequestWindow).Select(pair => pair.Key).ToArray())
+                _resetRequests.Remove(key);
+
+            foreach (var key in _verifyAttempts.Where(pair => now - pair.Value.WindowStart >= VerifyAttemptWindow).Select(pair => pair.Key).ToArray())
+                _verifyAttempts.Remove(key);
+
+            foreach (var key in _pendingRequests.Where(pair => now >= pair.Value).Select(pair => pair.Key).ToArray())
+                _pendingRequests.Remove(key);
         }
     }
 
-    private void CleanupResetRequests()
+    /// <summary>
+    /// A claim on a token that has been spent but whose reset has not yet
+    /// gone through.
+    /// </summary>
+    public sealed class ResetTicket
     {
-        var cutoff = DateTimeOffset.UtcNow - ResetRequestWindow;
-        var keysToRemove = _resetRequests
-            .Where(kvp => kvp.Value.WindowStart < cutoff)
-            .Select(kvp => kvp.Key)
-            .ToArray();
+        private readonly TokenStore _store;
 
-        foreach (var key in keysToRemove)
+        private readonly TokenEntry _entry;
+
+        private int _settled;
+
+        internal ResetTicket(TokenStore store, TokenEntry entry)
         {
-            _resetRequests.TryRemove(key, out _);
+            _store = store;
+            _entry = entry;
+        }
+
+        /// <summary>
+        /// The reset went through. Retires the account's token for good.
+        /// </summary>
+        public void Commit()
+        {
+            if (Interlocked.Exchange(ref _settled, 1) == 0)
+                _store.CommitTicket(_entry);
+        }
+
+        /// <summary>
+        /// The reset did not go through, so the token was not really spent.
+        /// Puts it back, provided it is still the account's live token.
+        /// </summary>
+        public void Restore()
+        {
+            if (Interlocked.Exchange(ref _settled, 1) == 0)
+                _store.RestoreTicket(_entry);
         }
     }
 
-    private void CleanupVerifyAttempts()
-    {
-        var cutoff = DateTimeOffset.UtcNow - VerifyAttemptWindow;
-        var keysToRemove = _verifyAttempts
-            .Where(kvp => kvp.Value.WindowStart < cutoff)
-            .Select(kvp => kvp.Key)
-            .ToArray();
-
-        foreach (var key in keysToRemove)
-        {
-            _verifyAttempts.TryRemove(key, out _);
-        }
-    }
-
-    private void CleanupTokenAttempts()
-    {
-        var cutoff = DateTimeOffset.UtcNow - TokenExpiry;
-        var keysToRemove = _tokenAttempts
-            .Where(kvp => kvp.Value.LastAttempt < cutoff)
-            .Select(kvp => kvp.Key)
-            .ToArray();
-
-        foreach (var key in keysToRemove)
-        {
-            _tokenAttempts.TryRemove(key, out _);
-        }
-    }
-
-    private sealed class TokenEntry
+    internal sealed class TokenEntry
     {
         public required string Token { get; init; }
+
         public required string Username { get; init; }
+
         public required string IpAddress { get; init; }
-        public required DateTimeOffset CreatedAt { get; init; }
+
         public required DateTimeOffset ExpiresAt { get; init; }
-        private int _consumed;
 
-        public bool IsConsumed => _consumed == 1;
+        public int FailedAttempts { get; set; }
 
-        public bool TryConsume()
-        {
-            return Interlocked.CompareExchange(ref _consumed, 1, 0) == 0;
-        }
+        public bool IsConsumed { get; set; }
     }
 
-    private sealed class ResetRequestEntry
+    private sealed class WindowEntry(DateTimeOffset windowStart)
     {
-        public DateTimeOffset WindowStart { get; set; }
-        private int _count;
+        public DateTimeOffset WindowStart { get; } = windowStart;
 
-        public int Count
-        {
-            get => _count;
-            set => _count = value;
-        }
-
-        public void IncrementCount()
-        {
-            Interlocked.Increment(ref _count);
-        }
-
-        private readonly ConcurrentDictionary<string, DateTimeOffset> _pendingUsernames = new();
-
-        public bool TryGetPendingRequestTime(string username, out DateTimeOffset requestTime)
-        {
-            return _pendingUsernames.TryGetValue(username, out requestTime);
-        }
-
-        public void AddPendingUsername(string username)
-        {
-            _pendingUsernames[username] = DateTimeOffset.UtcNow;
-        }
-
-        public void RemovePendingUsername(string username)
-        {
-            _pendingUsernames.TryRemove(username, out _);
-        }
-    }
-
-    private sealed class VerifyAttemptEntry
-    {
-        public DateTimeOffset WindowStart { get; set; }
-        private int _count;
-
-        public int Count
-        {
-            get => _count;
-            set => _count = value;
-        }
-
-        public void IncrementCount()
-        {
-            Interlocked.Increment(ref _count);
-        }
-    }
-
-    private sealed class TokenAttemptEntry
-    {
-        public DateTimeOffset LastAttempt { get; set; }
-        public int FailedCount { get; set; }
+        public int Count { get; set; } = 1;
     }
 }

@@ -8,7 +8,7 @@ A [Shoko](https://shokoanime.com/) plugin that handles password reset and userna
 - **Forgot Username** — Logs all registered usernames to the server console on request.
 - **Token-based Auth** — Crypto-random 12-char hex reset tokens with 15-minute expiry, stored in memory, displayed in XXXX-XXXX-XXXX format.
 - **Audit Logging** — Every reset request and attempt is logged with full client IP chain (X-Forwarded-For).
-- **Rate Limiting** — Prevents abuse with strict request limits.
+- **Rate Limiting** — Prevents abuse with strict request limits, each applied as one atomic check-and-record.
 - **IP Security** — Tokens are bound to the requesting IP address.
 
 ## Installation
@@ -40,21 +40,77 @@ The plugin supports the following configuration options in your Shoko settings:
 
 ## Rate Limits
 
-To prevent abuse, the following rate limits are enforced:
+To prevent abuse, the following limits are enforced. Each is a single
+check-and-record operation, so requests that arrive together cannot all pass
+a check none of them has yet paid for.
 
-| Endpoint | Limit | Scope |
-|----------|-------|-------|
-| `RequestUsernames` | 1 per 24 hours | Global (all IPs) |
-| `RequestReset` | 5 per day | Per IP address |
-| `RequestReset` | 1 concurrent | Per username + IP combination |
+| Limit | Scope | Applies to |
+|-------|-------|------------|
+| 1 per 24 hours | Global (all IPs) | `RequestUsernames` |
+| 5 per day | Per IP address | `RequestReset` |
+| 1 outstanding request | Per username + IP address | `RequestReset` |
+| 10 attempts per day | Per IP address | `VerifyToken`, `ResetPassword` |
+| 5 failed attempts | Per account | `VerifyToken`, `ResetPassword` |
 
-When a rate limit is exceeded, the API returns **429 Too Many Requests** with a `Retry-After` header and a `retryAfter` field in the response body indicating when the client can retry.
+The 10-attempts-per-day budget is spent by `VerifyToken` and `ResetPassword`,
+but it also **gates** `RequestReset` and `RequestUsernames`: an address that
+has burned through its attempts cannot mint fresh material either. A
+verification that succeeds costs nothing, so checking a token and then
+spending it is one attempt rather than two.
+
+The per-account ceiling is keyed on the account being reset, not on the token
+submitted, so wrong guesses accumulate however they are spelled. Reaching it
+retires that account's outstanding token; requesting a new reset starts over.
+
+When a limit is exceeded the API returns **429 Too Many Requests** with a
+`Retry-After` header and a `retryAfter` field in the response body indicating
+when the client can retry.
+
+## Tokens
+
+- A token is 12 crypto-random hex characters, displayed as `XXXX-XXXX-XXXX`,
+  and accepted with or without dashes or spaces and in any case.
+- A token is spendable for **15 minutes**, and expiry is decided on every
+  request rather than by a background sweep.
+- An account has **at most one** outstanding token. Requesting a new one
+  retires the previous one, and spending one retires it for good.
+- Tokens are bound to the IP address that requested them.
+
+## Validation
+
+| Field | Rule |
+|-------|------|
+| `username` | Trimmed; must be non-empty, at most 256 characters, and free of control characters. Matched case-insensitively, the way Shoko itself resolves usernames. |
+| `token` | 12 hexadecimal characters after dashes and spaces are removed. |
+| `newPassword` | At most 1024 characters, which is the host's own limit. **May be empty** — Shoko supports passwordless accounts. |
+
+A username is refused rather than sanitised because the server console — which
+is where reset tokens are delivered — renders log messages into a plain,
+unescaped, single-line layout, so a username carrying a newline could write a
+line that reads exactly like a token line for another account.
+
+Anything that fails validation returns **400 Bad Request**.
 
 ## IP Address Requirements
 
-All endpoints require a determinable client IP address. If the IP cannot be determined (e.g., missing connection info), the API returns **400 Bad Request**.
+All endpoints require a determinable client IP address. If the IP cannot be
+determined (e.g. missing connection info), the API returns **400 Bad Request**.
 
-Reset tokens are bound to the IP address that requested them. Verification and consumption will fail if the IP doesn't match, returning **403 Forbidden**.
+Reset tokens are bound to the IP address that requested them. A token
+presented from a different address does not check out — and is reported
+exactly the same way as a token that never existed, has expired, or has
+already been spent. Those cases are deliberately indistinguishable to the
+caller, because telling them apart would confirm a guessed token to whoever
+guessed it:
+
+- `VerifyToken` answers **200 OK** with `{"valid": false}`. It is a question,
+  and that is the answer to it.
+- `ResetPassword` answers **403 Forbidden**. It is an action, and it was
+  refused.
+
+A token that has taken too many failed attempts is reported separately, as
+**403 Forbidden**, by both endpoints — that state is already public to anyone
+who caused it.
 
 ## API Endpoints
 
@@ -77,6 +133,7 @@ Requires the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
 ```bash
 dotnet restore
 dotnet build --configuration Release
+dotnet test
 ```
 
 The compiled assembly will be located at `source/bin/Release/net10.0/Shoko.Plugin.Forgotten.dll`.
