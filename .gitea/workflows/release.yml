@@ -3,29 +3,49 @@ name: Release Build
 # The Gitea half of dual hosting (.github/workflows/release.yml is the
 # GitHub half). Both fire at the same tag, each builds its own archive
 # and each writes its own manifest naming its own copy, because the two
-# archives are not the same bytes: the assembly embeds the checkout path
-# and the zip embeds the mtimes, so one checksum cannot describe both.
+# archives are not the same bytes: the zip embeds the mtimes, so one
+# checksum cannot describe both.
+#
+# The two halves run the same steps in the same order. They differ only
+# where the hosts do: the asset base URL, the token, the uploader, where
+# the release metadata comes from, the bot identity, the toolchain check
+# and the HTTP/1.1 workaround below.
 
 on:
   release:
     types: [published]
 
 env:
-  # This host's manifest lives on its own branch. `stable` is shared with
-  # GitHub, whose CI commits a manifest of GitHub URLs to it, so a second
-  # CI writing the same file on the same branch would fork it on the two
-  # remotes and every later push would be a non-fast-forward.
+  # The published manifest lives on a branch of its own and CI writes
+  # nowhere else. A manifest committed to `stable` is a bot commit on the
+  # branch people work from; and `stable` is shared with GitHub, so two
+  # CIs writing one file on it would fork the branch across the remotes
+  # and make every later push a non-fast-forward.
   METADATA_BRANCH: metadata
+  # One manifest at the branch root. This repository holds one plugin and
+  # cuts stable releases alone, so there is neither a plugin axis nor a
+  # channel axis to spend a path segment on.
   MANIFEST_PATH: manifest.json
-  # Anything a user reads out of a manifest points at the CDN; anything
-  # that talks to Gitea goes to the origin. github.com is behind SSO,
-  # so a download URL naming it is not installable.
-  ASSET_BASE_URL: https://github.com/revam/dotnet-shoko-plugin-forgotten/releases
-  # The proxy in front of github.com answers 403 to any HTTP/2 request
-  # that streams a body, which is every push over 1 MiB. GIT_CONFIG_*
-  # reaches actions/checkout's own git, which a `git config` step would
-  # not. Remove when the proxy is fixed; it is not a property of this
-  # workflow.
+  # The stub in the work tree. The live manifest is pulled over it before
+  # the build, the release entry is written from it, and the reset in the
+  # last step puts the stub back.
+  IDENTITY_MANIFEST: manifest.json
+  # Just the domain the release assets are served from, with no scheme
+  # and no path: the step below adds the scheme and appends
+  # `owner/repo/releases`, so one instance-wide value serves every
+  # repository. Anything a user reads out of a manifest points at the
+  # CDN; anything that talks to the Gitea host goes to the origin. That
+  # host is behind SSO, so a download URL naming it is not installable,
+  # and the CDN in front of it is deliberately a different host - which
+  # is why this cannot be derived from `github.server_url`. It is
+  # configured on the Gitea host, as a variable or a secret, rather than
+  # written here, because this file is published to GitHub as well.
+  ASSET_BASE_DOMAIN: ${{ vars.ASSET_BASE_DOMAIN || secrets.ASSET_BASE_DOMAIN }}
+  # The proxy in front of the Gitea host answers 403 to any HTTP/2
+  # request that streams a body, which is every push over 1 MiB.
+  # GIT_CONFIG_* reaches actions/checkout's own git, which a `git config`
+  # step would not. Remove when the proxy is fixed; it is not a property
+  # of this workflow.
   GIT_CONFIG_COUNT: "1"
   GIT_CONFIG_KEY_0: http.version
   GIT_CONFIG_VALUE_0: HTTP/1.1
@@ -58,16 +78,69 @@ jobs:
             }
           done
 
+      - name: Resolve the asset base URL
+        run: |
+          # Here rather than at the manifest step, which runs after the
+          # asset is already uploaded. An unset domain would otherwise
+          # publish a release entry whose download URL is `https:///…`,
+          # and a value pasted with a scheme or a trailing slash would
+          # publish one with the scheme or a slash doubled.
+          domain="${ASSET_BASE_DOMAIN}"
+          domain="${domain#https://}"
+          domain="${domain#http://}"
+          while [ "${domain%/}" != "${domain}" ]; do
+            domain="${domain%/}"
+          done
+          if [ -z "${domain}" ]; then
+            echo "ASSET_BASE_DOMAIN is unset." >&2
+            echo "Set it on the Gitea host, as a repository or organisation variable" >&2
+            echo "or secret, to the bare domain release assets are served from." >&2
+            exit 1
+          fi
+          case "${domain}" in
+            */*|*[[:space:]]*)
+              echo "ASSET_BASE_DOMAIN must be a bare domain, with no path and no spaces." >&2
+              echo "Got: ${ASSET_BASE_DOMAIN}" >&2
+              exit 1
+              ;;
+          esac
+          echo "ASSET_BASE_URL=https://${domain}/${GITHUB_REPOSITORY}/releases" >> "$GITHUB_ENV"
+
       - name: Fetch the live manifest
         run: |
           # checkout only sets up a remote-tracking ref for the branch it
           # checked out, hence the explicit refspec.
           #
           # No fallback. The branch is seeded by hand once; falling back
-          # to the copy on `stable` would publish this host's manifest
-          # carrying GitHub's download URLs.
+          # to the stub in the work tree would publish a release against a
+          # description that says it is a stub, with an empty release list
+          # in front of it. A fetch of a refspec naming a branch the
+          # remote does not have exits 128 with "couldn't find remote
+          # ref", so a first run stops here, before the build and well
+          # before the upload.
           git fetch --no-tags origin "+refs/heads/${METADATA_BRANCH}:refs/remotes/origin/${METADATA_BRANCH}"
-          git show "origin/${METADATA_BRANCH}:${MANIFEST_PATH}" > "${RUNNER_TEMP}/manifest.json"
+          git show "origin/${METADATA_BRANCH}:${MANIFEST_PATH}" > "${IDENTITY_MANIFEST}"
+
+      - name: Read the release metadata
+        env:
+          # Gitea has no GITHUB_TOKEN. The automatic token is GITEA_TOKEN,
+          # and it can write a release even though it cannot write a
+          # package registry.
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          # Gitea's release event payload is not GitHub's, so the body and
+          # the publish time are read back from the API rather than
+          # trusted from the event. Both files are always written, empty
+          # when the release carries neither: empty notes leave the
+          # `release_notes` key off the entry, and an empty timestamp falls
+          # back to now, both in the step that writes the entry.
+          curl --silent --show-error --fail \
+            --header "Authorization: token ${GITEA_TOKEN}" \
+            --header "Accept: application/json" \
+            "${GITHUB_SERVER_URL%/}/api/v1/repos/${GITHUB_REPOSITORY}/releases/tags/${{ github.event.release.tag_name }}" \
+            > "${RUNNER_TEMP}/release.json"
+          jq -r '.body // empty' "${RUNNER_TEMP}/release.json" > "${RUNNER_TEMP}/release-notes.md"
+          jq -r '.published_at // .created_at // empty' "${RUNNER_TEMP}/release.json" > "${RUNNER_TEMP}/released-at.txt"
 
       - name: Build
         run: dotnet build Shoko.Plugin.Forgotten.slnx --configuration Release
@@ -77,7 +150,6 @@ jobs:
       # builds but does not pass them is the release nobody would notice.
       - name: Test
         run: dotnet test Shoko.Plugin.Forgotten.slnx --configuration Release --no-build
-
       - name: Package
         run: |
           ZIP_NAME="Shoko.Plugin.Forgotten-${{ github.event.release.tag_name }}-any.zip"
@@ -88,35 +160,25 @@ jobs:
 
       - name: Upload to Release
         env:
-          # Gitea has no GITHUB_TOKEN. The automatic token is GITEA_TOKEN,
-          # and it can write a release even though it cannot write a
-          # package registry.
           GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
         run: |
           scripts/gitea-release-asset.sh \
             --tag "${{ github.event.release.tag_name }}" \
             "${ZIP_NAME}"
 
-      - name: Update Manifest
-        env:
-          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+      - name: Commit the manifest on the metadata branch
         run: |
           TAG="${{ github.event.release.tag_name }}"
           VERSION="${TAG#v}"
           SOURCE_REVISION=$(git rev-parse HEAD)
-          # Gitea's release event payload is not GitHub's, so the publish
-          # time is read back from the API rather than trusted from the
-          # event. A payload carrying neither timestamp falls back to
-          # now; an API call that fails stops the step.
-          RELEASED_AT=$(curl --silent --show-error --fail \
-            --header "Authorization: token ${GITEA_TOKEN}" \
-            --header "Accept: application/json" \
-            "${GITHUB_SERVER_URL%/}/api/v1/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
-            | jq -r '.published_at // .created_at // empty')
+          RELEASED_AT=$(cat "${RUNNER_TEMP}/released-at.txt")
           RELEASED_AT="${RELEASED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
           CHECKSUM=$(sha256sum "${ZIP_NAME}" | awk '{ print $1 }')
           URL="${ASSET_BASE_URL}/${TAG}/${ZIP_NAME}"
 
+          # The notes reach jq as a file rather than as an argument. They
+          # are arbitrary markdown written by a human, and --rawfile takes
+          # the whole file as one string with no shell in between.
           RELEASE_ENTRY=$(jq -n \
             --arg version "$VERSION" \
             --arg tag "$TAG" \
@@ -124,13 +186,14 @@ jobs:
             --arg released_at "$RELEASED_AT" \
             --arg url "$URL" \
             --arg checksum "$CHECKSUM" \
+            --rawfile release_notes "${RUNNER_TEMP}/release-notes.md" \
             '{
               version: $version,
               tag: $tag,
               source_revision: $source_revision,
               released_at: $released_at,
               channel: "Stable",
-              release_notes: null,
+              release_notes: $release_notes,
               archives: [
                 {
                   runtime: "any",
@@ -139,24 +202,44 @@ jobs:
                   checksum: $checksum
                 }
               ]
-            }')
+            }
+            # The schema types `release_notes` as a string, so a release
+            # with no body leaves the key out rather than writing a null.
+            | if .release_notes | test("\\S") then . else del(.release_notes) end')
 
+          # Newest first, and a re-cut of a version the manifest already
+          # lists replaces that entry instead of adding a second one.
           jq --argjson release "$RELEASE_ENTRY" '
             .releases |= [ $release ] + (. | map(select(.version != $release.version)))
-          ' "${RUNNER_TEMP}/manifest.json" > "${RUNNER_TEMP}/manifest.next.json"
-          mv "${RUNNER_TEMP}/manifest.next.json" "${RUNNER_TEMP}/manifest.json"
+          ' "${IDENTITY_MANIFEST}" > "${RUNNER_TEMP}/manifest.json"
 
-          # The work tree has to be clean to switch branches, and the
-          # manifest travels in RUNNER_TEMP rather than in a stash: a
+          # The manifest travels in RUNNER_TEMP rather than in a stash: a
           # stash of a path that already exists on the metadata branch
-          # conflicts on every apply.
+          # conflicts on every apply. The work tree also has to be clean
+          # to switch branches, and the reset puts the stub back over the
+          # live manifest fetched above.
           git reset --hard
           git checkout -B "${METADATA_BRANCH}" "origin/${METADATA_BRANCH}"
           cp "${RUNNER_TEMP}/manifest.json" "${MANIFEST_PATH}"
+          # The host comes from the run rather than from this file, which
+          # is published to GitHub as well. A bracketed local part is not
+          # a legal address, so the brackets stay in the display name.
+          GIT_HOST="${GITHUB_SERVER_URL#*://}"
           git config user.name "gitea-actions[bot]"
-          git config user.email "gitea-actions[bot]@noreply.github.com"
+          git config user.email "noreply.actions@${GIT_HOST%%/*}"
           git add "${MANIFEST_PATH}"
-          # The only commit and the only push, and it is not on a source
-          # branch, so `stable` stays byte-identical on both remotes.
-          git commit -m "ci: update manifest for ${TAG}"
-          git push origin "${METADATA_BRANCH}"
+          # The only commit and the only push, and it is on the metadata
+          # branch. Nothing lands on a source branch, so `stable` stays
+          # byte-identical on both remotes and nobody has to pull a bot
+          # commit before their next change.
+          #
+          # Guarded, because `git commit` exits 1 on an empty index and
+          # this step runs after the asset is uploaded: a re-run that
+          # produced a byte-identical manifest would otherwise fail a
+          # release that had already succeeded.
+          if git diff --cached --quiet; then
+            echo "Manifest unchanged; nothing to commit."
+          else
+            git commit -m "ci: update manifest for ${TAG}"
+            git push origin "${METADATA_BRANCH}"
+          fi

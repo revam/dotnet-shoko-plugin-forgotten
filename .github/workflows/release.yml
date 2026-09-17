@@ -1,22 +1,89 @@
 name: Release Build
 
+# The GitHub half of dual hosting (.gitea/workflows/release.yml is the
+# Gitea half). Both fire at the same tag, each builds its own archive
+# and each writes its own manifest naming its own copy, because the two
+# archives are not the same bytes: the zip embeds the mtimes, so one
+# checksum cannot describe both.
+#
+# The two halves run the same steps in the same order. They differ only
+# where the hosts do: the asset base URL, the token, the uploader, where
+# the release metadata comes from, and the bot identity.
+
 on:
   release:
     types: [published]
 
+env:
+  # The published manifest lives on a branch of its own and CI writes
+  # nowhere else. A manifest committed to `stable` is a bot commit on the
+  # branch people work from; and `stable` is shared with Gitea, so two
+  # CIs writing one file on it would fork the branch across the remotes
+  # and make every later push a non-fast-forward.
+  METADATA_BRANCH: metadata
+  # One manifest at the branch root. This repository holds one plugin and
+  # cuts stable releases alone, so there is neither a plugin axis nor a
+  # channel axis to spend a path segment on.
+  MANIFEST_PATH: manifest.json
+  # The stub in the work tree. The live manifest is pulled over it before
+  # the build, the release entry is written from it, and the reset in the
+  # last step puts the stub back.
+  IDENTITY_MANIFEST: manifest.json
+  # GitHub serves release assets from its own download route under the
+  # repository, so the base is the server and repository this run already
+  # names rather than a CDN in front of them.
+  ASSET_BASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned. `ubuntu-latest` is a moving pointer, and 24.04 is the image
+    # that carries node24 - which the action pins below need, node20
+    # being end of life - along with zip, jq and curl.
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-dotnet@v4
+      # The image has no SDK. `global-json-file` rather than a literal
+      # version, so this cannot drift from what a developer builds with.
+      - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: 10.0.x
+          global-json-file: global.json
+
+      - name: Fetch the live manifest
+        run: |
+          # checkout only sets up a remote-tracking ref for the branch it
+          # checked out, hence the explicit refspec.
+          #
+          # No fallback. The branch is seeded by hand once; falling back
+          # to the stub in the work tree would publish a release against a
+          # description that says it is a stub, with an empty release list
+          # in front of it. A fetch of a refspec naming a branch the
+          # remote does not have exits 128 with "couldn't find remote
+          # ref", so a first run stops here, before the build and well
+          # before the upload.
+          git fetch --no-tags origin "+refs/heads/${METADATA_BRANCH}:refs/remotes/origin/${METADATA_BRANCH}"
+          git show "origin/${METADATA_BRANCH}:${MANIFEST_PATH}" > "${IDENTITY_MANIFEST}"
+
+      - name: Read the release metadata
+        env:
+          # Through the environment rather than as expressions inside
+          # `run:`. Release notes are arbitrary markdown from a human, and
+          # interpolating them into a shell script would let a backtick or
+          # a `$(` in someone's notes run as a command on the runner.
+          RELEASE_BODY: ${{ github.event.release.body }}
+          RELEASE_PUBLISHED_AT: ${{ github.event.release.published_at }}
+        run: |
+          # GitHub carries both on the release event, so they are taken
+          # from there rather than read back from the API. Both files are
+          # always written, empty when the release carries neither: empty
+          # notes leave the `release_notes` key off the entry, and an empty
+          # timestamp falls back to now, both in the step that writes it.
+          printf '%s' "${RELEASE_BODY}" > "${RUNNER_TEMP}/release-notes.md"
+          printf '%s' "${RELEASE_PUBLISHED_AT}" > "${RUNNER_TEMP}/released-at.txt"
 
       - name: Build
         run: dotnet build Shoko.Plugin.Forgotten.slnx --configuration Release
@@ -26,7 +93,6 @@ jobs:
       # builds but does not pass them is the release nobody would notice.
       - name: Test
         run: dotnet test Shoko.Plugin.Forgotten.slnx --configuration Release --no-build
-
       - name: Package
         run: |
           ZIP_NAME="Shoko.Plugin.Forgotten-${{ github.event.release.tag_name }}-any.zip"
@@ -43,17 +109,19 @@ jobs:
             "${ZIP_NAME}" \
             --repo "${{ github.repository }}"
 
-      - name: Update Manifest
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Commit the manifest on the metadata branch
         run: |
           TAG="${{ github.event.release.tag_name }}"
           VERSION="${TAG#v}"
           SOURCE_REVISION=$(git rev-parse HEAD)
-          RELEASED_AT="${{ github.event.release.published_at }}"
+          RELEASED_AT=$(cat "${RUNNER_TEMP}/released-at.txt")
+          RELEASED_AT="${RELEASED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
           CHECKSUM=$(sha256sum "${ZIP_NAME}" | awk '{ print $1 }')
-          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${ZIP_NAME}"
+          URL="${ASSET_BASE_URL}/${TAG}/${ZIP_NAME}"
 
+          # The notes reach jq as a file rather than as an argument. They
+          # are arbitrary markdown written by a human, and --rawfile takes
+          # the whole file as one string with no shell in between.
           RELEASE_ENTRY=$(jq -n \
             --arg version "$VERSION" \
             --arg tag "$TAG" \
@@ -61,13 +129,14 @@ jobs:
             --arg released_at "$RELEASED_AT" \
             --arg url "$URL" \
             --arg checksum "$CHECKSUM" \
+            --rawfile release_notes "${RUNNER_TEMP}/release-notes.md" \
             '{
               version: $version,
               tag: $tag,
               source_revision: $source_revision,
               released_at: $released_at,
               channel: "Stable",
-              release_notes: null,
+              release_notes: $release_notes,
               archives: [
                 {
                   runtime: "any",
@@ -76,14 +145,40 @@ jobs:
                   checksum: $checksum
                 }
               ]
-            }')
+            }
+            # The schema types `release_notes` as a string, so a release
+            # with no body leaves the key out rather than writing a null.
+            | if .release_notes | test("\\S") then . else del(.release_notes) end')
 
+          # Newest first, and a re-cut of a version the manifest already
+          # lists replaces that entry instead of adding a second one.
           jq --argjson release "$RELEASE_ENTRY" '
             .releases |= [ $release ] + (. | map(select(.version != $release.version)))
-          ' manifest.json > manifest.json.tmp && mv manifest.json.tmp manifest.json
+          ' "${IDENTITY_MANIFEST}" > "${RUNNER_TEMP}/manifest.json"
 
+          # The manifest travels in RUNNER_TEMP rather than in a stash: a
+          # stash of a path that already exists on the metadata branch
+          # conflicts on every apply. The work tree also has to be clean
+          # to switch branches, and the reset puts the stub back over the
+          # live manifest fetched above.
+          git reset --hard
+          git checkout -B "${METADATA_BRANCH}" "origin/${METADATA_BRANCH}"
+          cp "${RUNNER_TEMP}/manifest.json" "${MANIFEST_PATH}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add manifest.json
-          git commit -m "ci: update manifest for ${TAG}"
-          git push origin HEAD:stable
+          git add "${MANIFEST_PATH}"
+          # The only commit and the only push, and it is on the metadata
+          # branch. Nothing lands on a source branch, so `stable` stays
+          # byte-identical on both remotes and nobody has to pull a bot
+          # commit before their next change.
+          #
+          # Guarded, because `git commit` exits 1 on an empty index and
+          # this step runs after the asset is uploaded: a re-run that
+          # produced a byte-identical manifest would otherwise fail a
+          # release that had already succeeded.
+          if git diff --cached --quiet; then
+            echo "Manifest unchanged; nothing to commit."
+          else
+            git commit -m "ci: update manifest for ${TAG}"
+            git push origin "${METADATA_BRANCH}"
+          fi
