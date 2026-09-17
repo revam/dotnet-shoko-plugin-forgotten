@@ -26,9 +26,13 @@ env:
   # cuts stable releases alone, so there is neither a plugin axis nor a
   # channel axis to spend a path segment on.
   MANIFEST_PATH: manifest.json
-  # The stub in the work tree. The live manifest is pulled over it before
-  # the build, the release entry is written from it, and the reset in the
-  # last step puts the stub back.
+  # The stub in the work tree. `Shoko.BuildTools.Targets` reaches it from
+  # `source/` through the parent leg of its search and stamps what it
+  # reads into the assembly; shoko-build takes identity and tags from the
+  # same path and writes the release entry back into it. The live manifest
+  # is pulled over it before anything builds, so the embedded metadata and
+  # the published manifest cannot disagree, and the reset in the last step
+  # puts the stub back.
   IDENTITY_MANIFEST: manifest.json
   # Just the domain the release assets are served from, with no scheme
   # and no path: the step below adds the scheme and appends
@@ -54,7 +58,7 @@ jobs:
   build:
     # Pinned. `ubuntu-latest` is a moving pointer, and 24.04 is the image
     # that carries node24 - which the action pins below need, node20
-    # being end of life - along with zip, jq and curl.
+    # being end of life - along with jq and curl.
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -71,7 +75,7 @@ jobs:
 
       - name: Check the toolchain
         run: |
-          for tool in dotnet zip jq curl git; do
+          for tool in dotnet jq curl git; do
             command -v "$tool" >/dev/null 2>&1 || {
               echo "runner image is missing: ${tool}" >&2
               exit 1
@@ -121,26 +125,23 @@ jobs:
           git fetch --no-tags origin "+refs/heads/${METADATA_BRANCH}:refs/remotes/origin/${METADATA_BRANCH}"
           git show "origin/${METADATA_BRANCH}:${MANIFEST_PATH}" > "${IDENTITY_MANIFEST}"
 
-      - name: Read the release metadata
+      - name: Read the release notes
         env:
           # Gitea has no GITHUB_TOKEN. The automatic token is GITEA_TOKEN,
           # and it can write a release even though it cannot write a
           # package registry.
           GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
         run: |
-          # Gitea's release event payload is not GitHub's, so the body and
-          # the publish time are read back from the API rather than
-          # trusted from the event. Both files are always written, empty
-          # when the release carries neither: empty notes leave the
-          # `release_notes` key off the entry, and an empty timestamp falls
-          # back to now, both in the step that writes the entry.
+          # Gitea's release event payload is not GitHub's, so the body is
+          # read back from the API rather than trusted from the event. The
+          # file is always written, empty when the release carries no body:
+          # a --release-notes-path shoko-build cannot read stops it, while
+          # an empty one just leaves the notes off the release entry.
           curl --silent --show-error --fail \
             --header "Authorization: token ${GITEA_TOKEN}" \
             --header "Accept: application/json" \
             "${GITHUB_SERVER_URL%/}/api/v1/repos/${GITHUB_REPOSITORY}/releases/tags/${{ github.event.release.tag_name }}" \
-            > "${RUNNER_TEMP}/release.json"
-          jq -r '.body // empty' "${RUNNER_TEMP}/release.json" > "${RUNNER_TEMP}/release-notes.md"
-          jq -r '.published_at // .created_at // empty' "${RUNNER_TEMP}/release.json" > "${RUNNER_TEMP}/released-at.txt"
+            | jq -r '.body // empty' > "${RUNNER_TEMP}/release-notes.md"
 
       - name: Build
         run: dotnet build Shoko.Plugin.Forgotten.slnx --configuration Release
@@ -150,74 +151,59 @@ jobs:
       # builds but does not pass them is the release nobody would notice.
       - name: Test
         run: dotnet test Shoko.Plugin.Forgotten.slnx --configuration Release --no-build
-      - name: Package
-        run: |
-          ZIP_NAME="Shoko.Plugin.Forgotten-${{ github.event.release.tag_name }}-any.zip"
-          cd source/bin/Release/net10.0
-          zip "../../../../${ZIP_NAME}" Shoko.Plugin.Forgotten.dll
-          cd ../../../..
-          echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
 
+      # Pinned in .config/dotnet-tools.json, so the packaging of a release
+      # is reproducible instead of depending on whichever shoko-build is
+      # latest on the day it is cut.
+      - name: Restore the build tool
+        run: dotnet tool restore
+
+      # shoko-build discovers the plugin tags from the source, builds the
+      # project, packs the whole output directory (dependencies and the
+      # .deps.json included, not just the plugin assembly), checksums the
+      # archive and writes the release entry into the manifest with the
+      # abstraction version the assembly was actually compiled against. It
+      # reads the project from the working directory, hence `source`, and
+      # updates the manifest in place - the live one, fetched over the stub
+      # by the step above.
+      #
+      # Everything after the bare `--` reaches MSBuild, which is how
+      # `RepositoryUrl` is set: the value differs per host and this branch
+      # is published to both, so it cannot live in the csproj. Every
+      # shoko-build flag belongs before that `--`, because `-p` on this
+      # side of it is shoko-build's own `--prune` and would drop published
+      # releases from the manifest.
+      - name: Build and package
+        working-directory: source
+        run: |
+          dotnet shoko-build \
+            --configuration Release \
+            --channel Stable \
+            --tag "${{ github.event.release.tag_name }}" \
+            --release-notes-path "${RUNNER_TEMP}/release-notes.md" \
+            --manifest "${GITHUB_WORKSPACE}/${IDENTITY_MANIFEST}" \
+            --output "${GITHUB_WORKSPACE}/dist/{name}-{tag}-{runtime}.zip" \
+            --url "${ASSET_BASE_URL}/{tag}/{name}-{tag}-{runtime}.zip" \
+            -- -p:RepositoryUrl=${{ github.server_url }}/${{ github.repository }}
+
+      # A glob rather than a name, so an archive per runtime identifier
+      # uploads without touching this step.
       - name: Upload to Release
         env:
           GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
         run: |
           scripts/gitea-release-asset.sh \
             --tag "${{ github.event.release.tag_name }}" \
-            "${ZIP_NAME}"
+            dist/*.zip
 
       - name: Commit the manifest on the metadata branch
         run: |
-          TAG="${{ github.event.release.tag_name }}"
-          VERSION="${TAG#v}"
-          SOURCE_REVISION=$(git rev-parse HEAD)
-          RELEASED_AT=$(cat "${RUNNER_TEMP}/released-at.txt")
-          RELEASED_AT="${RELEASED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
-          CHECKSUM=$(sha256sum "${ZIP_NAME}" | awk '{ print $1 }')
-          URL="${ASSET_BASE_URL}/${TAG}/${ZIP_NAME}"
-
-          # The notes reach jq as a file rather than as an argument. They
-          # are arbitrary markdown written by a human, and --rawfile takes
-          # the whole file as one string with no shell in between.
-          RELEASE_ENTRY=$(jq -n \
-            --arg version "$VERSION" \
-            --arg tag "$TAG" \
-            --arg source_revision "$SOURCE_REVISION" \
-            --arg released_at "$RELEASED_AT" \
-            --arg url "$URL" \
-            --arg checksum "$CHECKSUM" \
-            --rawfile release_notes "${RUNNER_TEMP}/release-notes.md" \
-            '{
-              version: $version,
-              tag: $tag,
-              source_revision: $source_revision,
-              released_at: $released_at,
-              channel: "Stable",
-              release_notes: $release_notes,
-              archives: [
-                {
-                  runtime: "any",
-                  abstraction: "6.0.0",
-                  url: $url,
-                  checksum: $checksum
-                }
-              ]
-            }
-            # The schema types `release_notes` as a string, so a release
-            # with no body leaves the key out rather than writing a null.
-            | if .release_notes | test("\\S") then . else del(.release_notes) end')
-
-          # Newest first, and a re-cut of a version the manifest already
-          # lists replaces that entry instead of adding a second one.
-          jq --argjson release "$RELEASE_ENTRY" '
-            .releases |= [ $release ] + (. | map(select(.version != $release.version)))
-          ' "${IDENTITY_MANIFEST}" > "${RUNNER_TEMP}/manifest.json"
-
           # The manifest travels in RUNNER_TEMP rather than in a stash: a
           # stash of a path that already exists on the metadata branch
           # conflicts on every apply. The work tree also has to be clean
           # to switch branches, and the reset puts the stub back over the
-          # live manifest fetched above.
+          # live manifest fetched above, so the copy has to happen first.
+          cp "${IDENTITY_MANIFEST}" "${RUNNER_TEMP}/manifest.json"
           git reset --hard
           git checkout -B "${METADATA_BRANCH}" "origin/${METADATA_BRANCH}"
           cp "${RUNNER_TEMP}/manifest.json" "${MANIFEST_PATH}"
@@ -240,6 +226,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "Manifest unchanged; nothing to commit."
           else
-            git commit -m "ci: update manifest for ${TAG}"
+            git commit -m "ci: update manifest for ${{ github.event.release.tag_name }}"
             git push origin "${METADATA_BRANCH}"
           fi

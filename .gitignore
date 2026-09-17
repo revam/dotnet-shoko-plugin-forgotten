@@ -21,3 +21,6 @@ obj/
 ## Ignore OS files
 .DS_Store
 Thumbs.db
+
+## Ignore packaged plugin archives
+dist/

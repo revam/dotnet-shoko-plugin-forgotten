@@ -6,7 +6,6 @@
         <GenerateDocumentationFile>true</GenerateDocumentationFile>
         <Title>Shoko Forgotten</Title>
         <Authors>revam</Authors>
-        <RepositoryUrl>https://github.com/revam/dotnet-shoko-plugin-forgotten</RepositoryUrl>
         <Version>1.0.3</Version>
         <Configurations>Debug;Release</Configurations>
         <Platforms>AnyCPU;x64</Platforms>
@@ -29,6 +28,11 @@
     </ItemGroup>
 
     <ItemGroup>
+        <!-- Injects the embedded plugin identity metadata the server reads during
+             discovery. PrivateAssets alone is not enough: without ExcludeAssets
+             the package's own MSBuild tasks and satellite assemblies end up in
+             the plugin output. -->
+        <PackageReference Include="Shoko.BuildTools.Targets" Version="0.3.0" PrivateAssets="All" ExcludeAssets="runtime" />
         <PackageReference Include="Microsoft.CodeAnalysis.NetAnalyzers" Version="10.0.203" PrivateAssets="All" />
         <PackageReference Include="SmartAnalyzers.MultithreadingAnalyzer" Version="1.1.31" PrivateAssets="All" />
     </ItemGroup>
