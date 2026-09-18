@@ -5,12 +5,29 @@
   "authors": "revam",
   "repository_url": "https://github.com/revam/dotnet-shoko-plugin-forgotten",
   "tags": [
+    "service-registration",
     "password-reset",
     "account-recovery",
     "hosted-service",
     "api"
   ],
   "releases": [
+    {
+      "version": "1.0.4",
+      "tag": "v1.0.4",
+      "released_at": "2026-09-18T04:46:22.7142489Z",
+      "channel": "Stable",
+      "release_notes": "Failed reset-code attempts now count towards Shoko\u0027s shared authentication lockout, so a client guessing codes is locked out server-wide rather than only here, and a lockout earned at sign-in blocks a reset request too.\n\nOnly a genuinely unknown code is charged: a malformed one, or a correct one the host then refused to act on, costs nothing. A completed reset clears both the client and the account lockout, so somebody who was locked out for forgetting their password can sign in with the new one.\n\nAlso rebuilt against the current abstractions and moved release packaging onto \u0060shoko-build\u0060.\n\nRequires Shoko Server with abstractions \u00606.0.0-alpha.89\u0060.",
+      "dependencies": [],
+      "archives": [
+        {
+          "runtime": "any",
+          "abstraction": "6.0.0",
+          "url": "https://github.com/revam/dotnet-shoko-plugin-forgotten/releases/download/v1.0.4/Forgotten-v1.0.4-any.zip",
+          "checksum": "sha256:01422decee85d40edb9d211bf28218d113197e6eea4a5d8110035705f230be6f"
+        }
+      ]
+    },
     {
       "version": "1.0.3",
       "tag": "v1.0.3",
