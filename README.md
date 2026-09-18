@@ -8,7 +8,8 @@ A [Shoko](https://shokoanime.com/) plugin that handles password reset and userna
 - **Forgot Username** — Logs all registered usernames to the server console on request.
 - **Token-based Auth** — Crypto-random 12-char hex reset tokens with 15-minute expiry, stored in memory, displayed in XXXX-XXXX-XXXX format.
 - **Audit Logging** — Every reset request and attempt is logged with full client IP chain (X-Forwarded-For).
-- **Rate Limiting** — Prevents abuse with strict request limits, each applied as one atomic check-and-record.
+- **Shared Lockout** — Wrong reset codes are counted in Shoko's own authentication throttle, so a client guessing them is shut out of signing in too, and a client Shoko has already shut out finds these endpoints closed.
+- **Rate Limiting** — Bounds what one address can ask for, each limit applied as one atomic check-and-record.
 - **IP Security** — Tokens are bound to the requesting IP address.
 
 ## Installation
@@ -36,31 +37,70 @@ The plugin supports the following configuration options in your Shoko settings:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `TrustProxy` | `false` | When `true`, the plugin will read the `X-Forwarded-For` header to determine client IPs. Enable this only if Shoko is behind a trusted reverse proxy. When `false`, only the direct connection IP is used. Only the rightmost entry is believed, and only if it parses as an address, so a caller cannot vary the chain to escape rate limiting. |
+| `TrustProxy` | `false` | When `true`, the plugin will read the `X-Forwarded-For` header to determine client IPs. Enable this only if Shoko is behind a trusted reverse proxy. When `false`, only the direct connection IP is used. Only the rightmost entry is believed, and only if it parses as an address, so a caller cannot vary the chain to escape rate limiting. This governs the plugin's own limits and the address a token is bound to; Shoko's shared lockout always keys on the connection address. |
+
+## Guessing a Reset Code
+
+A reset code is a credential, so a wrong one is counted in Shoko's own
+authentication throttle rather than in a ledger this plugin keeps to itself.
+That store is shared with the core sign-in and with every other plugin, which
+cuts both ways and is meant to: a client working through codes here is shut
+out of signing in as well, and a client Shoko has already shut out finds
+these endpoints closed. The admin configures the thresholds under the
+server's authentication throttle settings; this plugin reads them and never
+restates them.
+
+Every endpoint asks the throttle **before** the account is looked up, passing
+the username the request named and never the code it submitted. Shoko counts
+failures for any username it is given, existing or not, so a name it has
+locked out and a name it has never heard of are refused identically.
+
+What is written back:
+
+| Outcome | Charged to |
+|---------|------------|
+| A code that checked out against nothing, or against an account whose code is locked | The client |
+| A code that was never shaped like one (**400**) | Nobody |
+| A code that held, but which Shoko then refused to act on | Nobody |
+| Asking for a code, or for the username list | Nobody |
+| A completed password reset | Cleared, for both the client and the account |
+
+The account dimension is only ever read or cleared, never charged. The
+username on a reset request is whatever the caller claimed it was, so
+counting a wrong code against it would let anyone who can spell a name lock
+its owner out of signing in.
+
+`VerifyToken` clears nothing even when the code holds. It answers a question
+rather than performing a reset, and the same code answers it for as long as
+it lives, so clearing the shared ledger there would hand whoever holds one
+code an unlimited supply of fresh password guesses at every other door. A
+completed `ResetPassword` does clear it, for both dimensions: the account's
+credential has actually changed at that point, and the person this plugin
+exists for is somebody who was locked out for forgetting it.
+
+Shoko keys its client lockout on the connection address, so `TrustProxy`
+does not apply to it — behind a reverse proxy every client shares one
+bucket there. It still applies to the limits below, which are this
+plugin's own.
 
 ## Rate Limits
 
-To prevent abuse, the following limits are enforced. Each is a single
-check-and-record operation, so requests that arrive together cannot all pass
-a check none of them has yet paid for.
+To bound what one address can ask this plugin to hold and to log, the
+following limits are enforced. Each is a single check-and-record operation,
+so requests that arrive together cannot all pass a check none of them has yet
+paid for. None of them is a failure counter.
 
 | Limit | Scope | Applies to |
 |-------|-------|------------|
 | 1 per 24 hours | Global (all IPs) | `RequestUsernames` |
 | 5 per day | Per IP address | `RequestReset` |
 | 1 outstanding request | Per username + IP address | `RequestReset` |
-| 10 attempts per day | Per IP address | `VerifyToken`, `ResetPassword` |
 | 5 failed attempts | Per account | `VerifyToken`, `ResetPassword` |
 
-The 10-attempts-per-day budget is spent by `VerifyToken` and `ResetPassword`,
-but it also **gates** `RequestReset` and `RequestUsernames`: an address that
-has burned through its attempts cannot mint fresh material either. A
-verification that succeeds costs nothing, so checking a token and then
-spending it is one attempt rather than two.
-
 The per-account ceiling is keyed on the account being reset, not on the token
-submitted, so wrong guesses accumulate however they are spelled. Reaching it
-retires that account's outstanding token; requesting a new reset starts over.
+submitted, so wrong guesses accumulate however they are spelled. It retires
+that account's outstanding token rather than locking the account out of
+anything; requesting a new reset starts over.
 
 When a limit is exceeded the API returns **429 Too Many Requests** with a
 `Retry-After` header and a `retryAfter` field in the response body indicating
@@ -112,13 +152,14 @@ A token that has taken too many failed attempts is **not** reported
 separately. It answers exactly as an unknown token does, and costs the caller
 the same. A lockout can only exist for an account that has a live token, so a
 distinct answer would have said "this account exists and has a reset in
-flight" — the one question every other line here is written to refuse — and
-reading it cost nothing, so it could be re-asked indefinitely.
+flight" — the one question every other line here is written to refuse — and a
+difference in what it cost would be the same disclosure by another route.
 
-Only the address a token is bound to can spend that token's attempts. A guess
-from anywhere else cannot succeed whatever it contains, so counting it would
-only have let a stranger exhaust the ceiling and deny the real user their
-reset.
+Only the address a token is bound to can spend that token's per-account
+ceiling. A guess from anywhere else cannot succeed whatever it contains, so
+counting it would only have let a stranger exhaust the ceiling and deny the
+real user their reset. It is still charged to the guesser's own client
+lockout.
 
 ## API Endpoints
 

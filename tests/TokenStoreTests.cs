@@ -30,7 +30,7 @@ public class TokenStoreTests
         var (store, _) = NewStore();
         var token = Issue(store, "admin");
 
-        Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", token, Ip, out _));
+        Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", token, Ip));
     }
 
     [Fact]
@@ -39,7 +39,7 @@ public class TokenStoreTests
         var (store, _) = NewStore();
         var token = Issue(store, "admin");
 
-        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", token, OtherIp, out _));
+        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", token, OtherIp));
     }
 
     /// <summary>
@@ -56,10 +56,10 @@ public class TokenStoreTests
         var token = Issue(store, "admin");
 
         clock.Advance(TokenStore.TokenExpiry - TimeSpan.FromSeconds(1));
-        Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", token, Ip, out _));
+        Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", token, Ip));
 
         clock.Advance(TimeSpan.FromSeconds(2));
-        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", token, Ip, out _));
+        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", token, Ip));
     }
 
     [Fact]
@@ -69,7 +69,7 @@ public class TokenStoreTests
         var token = Issue(store, "admin");
 
         clock.Advance(TokenStore.TokenExpiry);
-        Assert.Equal(TokenAttemptResult.Invalid, store.TryConsume("admin", token, Ip, out var ticket, out _));
+        Assert.Equal(TokenAttemptResult.Invalid, store.TryConsume("admin", token, Ip, out var ticket));
         Assert.Null(ticket);
     }
 
@@ -92,7 +92,7 @@ public class TokenStoreTests
         var expected = string.Equals(issuedTo, submittedAs, StringComparison.InvariantCultureIgnoreCase)
             ? TokenAttemptResult.Ok
             : TokenAttemptResult.Invalid;
-        Assert.Equal(expected, store.TryVerify(submittedAs, token, Ip, out _));
+        Assert.Equal(expected, store.TryVerify(submittedAs, token, Ip));
     }
 
     [Fact]
@@ -102,7 +102,7 @@ public class TokenStoreTests
         var token = Issue(store, "Admin");
 
         for (var attempt = 0; attempt < TokenStore.MaxFailedAttemptsPerToken * 2; attempt++)
-            Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", token, Ip, out _));
+            Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", token, Ip));
     }
 
     /// <summary>
@@ -117,28 +117,30 @@ public class TokenStoreTests
         var token = Issue(store, "admin");
 
         for (var attempt = 0; attempt < TokenStore.MaxFailedAttemptsPerToken; attempt++)
-            Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", Guess(attempt), Ip, out _));
+            Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", Guess(attempt), Ip));
 
-        Assert.Equal(TokenAttemptResult.LockedOut, store.TryVerify("admin", Guess(99), Ip, out _));
+        Assert.Equal(TokenAttemptResult.LockedOut, store.TryVerify("admin", Guess(99), Ip));
 
         // And the real token is gone with it, which is the point of a ceiling.
-        Assert.Equal(TokenAttemptResult.LockedOut, store.TryVerify("admin", token, Ip, out _));
+        Assert.Equal(TokenAttemptResult.LockedOut, store.TryVerify("admin", token, Ip));
     }
 
     /// <summary>
     /// Guessing against an account that has no live token creates no state at
     /// all. The old bookkeeping grew one entry per attacker-chosen string.
     /// </summary>
+    /// <remarks>
+    /// What bounds the guessing now lives in the host, so the store's only
+    /// obligation here is to keep answering the same way without accumulating
+    /// anything of its own.
+    /// </remarks>
     [Fact]
     public void Guessing_at_an_account_with_no_token_records_nothing_about_the_guess()
     {
         var (store, _) = NewStore();
 
-        for (var attempt = 0; attempt < TokenStore.MaxVerifyAttemptsPerIp; attempt++)
-            Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify($"ghost{attempt}", Guess(attempt), Ip, out _));
-
-        // The address is what ran out, not memory.
-        Assert.Equal(TokenAttemptResult.RateLimited, store.TryVerify("ghost", Guess(0), Ip, out _));
+        for (var attempt = 0; attempt < 64; attempt++)
+            Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify($"ghost{attempt}", Guess(attempt), Ip));
     }
 
     /// <summary>
@@ -152,8 +154,8 @@ public class TokenStoreTests
         var first = store.Generate("admin", Ip);
         var second = store.Generate("admin", Ip);
 
-        Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", second, Ip, out _));
-        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", first, Ip, out _));
+        Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", second, Ip));
+        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", first, Ip));
     }
 
     [Fact]
@@ -162,11 +164,11 @@ public class TokenStoreTests
         var (store, _) = NewStore();
         var token = Issue(store, "admin");
 
-        Assert.Equal(TokenAttemptResult.Ok, store.TryConsume("admin", token, Ip, out var ticket, out _));
+        Assert.Equal(TokenAttemptResult.Ok, store.TryConsume("admin", token, Ip, out var ticket));
         ticket!.Commit();
 
-        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", token, Ip, out _));
-        Assert.Equal(TokenAttemptResult.Invalid, store.TryConsume("admin", token, Ip, out _, out _));
+        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", token, Ip));
+        Assert.Equal(TokenAttemptResult.Invalid, store.TryConsume("admin", token, Ip, out _));
     }
 
     /// <summary>
@@ -180,10 +182,10 @@ public class TokenStoreTests
         var (store, _) = NewStore();
         var token = Issue(store, "admin");
 
-        Assert.Equal(TokenAttemptResult.Ok, store.TryConsume("admin", token, Ip, out var ticket, out _));
+        Assert.Equal(TokenAttemptResult.Ok, store.TryConsume("admin", token, Ip, out var ticket));
         ticket!.Restore();
 
-        Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", token, Ip, out _));
+        Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", token, Ip));
     }
 
     /// <summary>
@@ -195,13 +197,13 @@ public class TokenStoreTests
     {
         var (store, _) = NewStore();
         var first = store.Generate("admin", Ip);
-        Assert.Equal(TokenAttemptResult.Ok, store.TryConsume("admin", first, Ip, out var ticket, out _));
+        Assert.Equal(TokenAttemptResult.Ok, store.TryConsume("admin", first, Ip, out var ticket));
 
         var second = store.Generate("admin", Ip);
         ticket!.Restore();
 
-        Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", second, Ip, out _));
-        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", first, Ip, out _));
+        Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", second, Ip));
+        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", first, Ip));
     }
 
     [Fact]
@@ -209,50 +211,27 @@ public class TokenStoreTests
     {
         var (store, _) = NewStore();
         var token = Issue(store, "admin");
-        Assert.Equal(TokenAttemptResult.Ok, store.TryConsume("admin", token, Ip, out var ticket, out _));
+        Assert.Equal(TokenAttemptResult.Ok, store.TryConsume("admin", token, Ip, out var ticket));
 
         ticket!.Commit();
         ticket.Restore();
 
-        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", token, Ip, out _));
+        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", token, Ip));
     }
 
+    /// <summary>
+    /// The store never refuses a verification of its own accord any more —
+    /// the address ledger that used to do that is the host's now. A token
+    /// that holds keeps holding for as long as it lives.
+    /// </summary>
     [Fact]
-    public void A_verification_that_holds_costs_the_address_nothing()
+    public void A_verification_that_holds_keeps_holding()
     {
         var (store, _) = NewStore();
         var token = Issue(store, "admin");
 
-        for (var attempt = 0; attempt < TokenStore.MaxVerifyAttemptsPerIp * 3; attempt++)
-            Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", token, Ip, out _));
-
-        Assert.False(store.IsAttemptBudgetExhausted(Ip, out _));
-    }
-
-    [Fact]
-    public void An_address_that_has_run_out_of_attempts_is_told_when_it_may_return()
-    {
-        var (store, _) = NewStore();
-
-        for (var attempt = 0; attempt < TokenStore.MaxVerifyAttemptsPerIp; attempt++)
-            store.TryVerify($"ghost{attempt}", Guess(attempt), Ip, out _);
-
-        Assert.Equal(TokenAttemptResult.RateLimited, store.TryVerify("ghost", Guess(0), Ip, out var nextAllowedAt));
-        Assert.NotNull(nextAllowedAt);
-        Assert.False(store.IsAttemptBudgetExhausted(OtherIp, out _));
-    }
-
-    [Fact]
-    public void An_attempt_window_rolls_over()
-    {
-        var (store, clock) = NewStore();
-
-        for (var attempt = 0; attempt < TokenStore.MaxVerifyAttemptsPerIp; attempt++)
-            store.TryVerify($"ghost{attempt}", Guess(attempt), Ip, out _);
-
-        Assert.True(store.IsAttemptBudgetExhausted(Ip, out _));
-        clock.Advance(TokenStore.VerifyAttemptWindow);
-        Assert.False(store.IsAttemptBudgetExhausted(Ip, out _));
+        for (var attempt = 0; attempt < 64; attempt++)
+            Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", token, Ip));
     }
 
     [Fact]
@@ -307,17 +286,6 @@ public class TokenStoreTests
     }
 
     [Fact]
-    public void An_address_that_has_burned_its_attempts_may_not_mint_either()
-    {
-        var (store, _) = NewStore();
-
-        for (var attempt = 0; attempt < TokenStore.MaxVerifyAttemptsPerIp; attempt++)
-            store.TryVerify($"ghost{attempt}", Guess(attempt), Ip, out _);
-
-        Assert.Equal(ResetRequestResult.AttemptsExhausted, store.TryStartReset("admin", Ip, out _));
-    }
-
-    [Fact]
     public void The_username_dump_is_offered_once_a_day()
     {
         var (store, clock) = NewStore();
@@ -344,7 +312,7 @@ public class TokenStoreTests
         clock.Advance(TokenStore.TokenExpiry);
         store.RunCleanup();
 
-        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", token, Ip, out _));
+        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", token, Ip));
         Assert.Equal(ResetRequestResult.Ok, store.TryStartReset("admin", Ip, out _));
     }
 
@@ -354,26 +322,25 @@ public class TokenStoreTests
     /// <summary>
     /// A lockout can only exist for an account that has a live token, so an
     /// answer of "locked" is an answer of "this account exists and has a
-    /// reset in flight". It has to cost what a wrong guess costs, or it is a
-    /// free probe that can be repeated for ever.
+    /// reset in flight". Reading it has to keep answering "locked" rather
+    /// than decaying into something a probe could tell apart; what it
+    /// <em>costs</em> is the controller's business now, and
+    /// <see cref="ThrottlingTests"/> holds it to charging the same for both.
     /// </summary>
     [Fact]
-    public void A_locked_token_costs_the_address_what_a_wrong_one_costs()
+    public void A_locked_token_stays_locked_however_often_it_is_read()
     {
         var (store, _) = NewStore();
-        Issue(store, "admin");
+        var token = Issue(store, "admin");
 
-        // Burn the account's ceiling, which also spends that many attempts.
         for (var attempt = 0; attempt < TokenStore.MaxFailedAttemptsPerToken; attempt++)
-            Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", Guess(attempt), Ip, out _));
+            Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", Guess(attempt), Ip));
 
-        // Every further read of the locked state must draw down the same
-        // budget, so the address runs out rather than probing indefinitely.
-        var remaining = TokenStore.MaxVerifyAttemptsPerIp - TokenStore.MaxFailedAttemptsPerToken;
-        for (var attempt = 0; attempt < remaining; attempt++)
-            Assert.Equal(TokenAttemptResult.LockedOut, store.TryVerify("admin", Guess(99), Ip, out _));
+        for (var attempt = 0; attempt < 16; attempt++)
+            Assert.Equal(TokenAttemptResult.LockedOut, store.TryVerify("admin", Guess(99), Ip));
 
-        Assert.Equal(TokenAttemptResult.RateLimited, store.TryVerify("admin", Guess(99), Ip, out _));
+        // And the real token is gone with it, which is the point of a ceiling.
+        Assert.Equal(TokenAttemptResult.LockedOut, store.TryVerify("admin", token, Ip));
     }
 
     /// <summary>
@@ -387,14 +354,14 @@ public class TokenStoreTests
         var (store, _) = NewStore();
         var first = Issue(store, "admin");
 
-        Assert.Equal(TokenAttemptResult.Ok, store.TryConsume("admin", first, Ip, out var ticket, out _));
+        Assert.Equal(TokenAttemptResult.Ok, store.TryConsume("admin", first, Ip, out var ticket));
 
         // A second address asks while the first reset is mid-flight.
         var second = Issue(store, "admin", OtherIp);
 
         ticket!.Commit();
 
-        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", second, OtherIp, out _));
+        Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", second, OtherIp));
     }
 
     /// <summary>
@@ -409,9 +376,9 @@ public class TokenStoreTests
         var token = Issue(store, "admin");
 
         for (var attempt = 0; attempt < TokenStore.MaxFailedAttemptsPerToken * 2; attempt++)
-            Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", Guess(attempt), OtherIp, out _));
+            Assert.Equal(TokenAttemptResult.Invalid, store.TryVerify("admin", Guess(attempt), OtherIp));
 
-        Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", token, Ip, out _));
+        Assert.Equal(TokenAttemptResult.Ok, store.TryVerify("admin", token, Ip));
     }
 
     /// <summary>

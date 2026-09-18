@@ -23,6 +23,11 @@ namespace Shoko.Plugin.Forgotten.API.Controllers.v1;
 /// </remarks>
 /// <param name="userService">The user service.</param>
 /// <param name="tokenStore">The token store for managing reset tokens.</param>
+/// <param name="throttleService">
+/// The host's authentication throttle, shared with the core sign-in and with
+/// every other plugin. See the <c>Throttling</c> region for what this plugin
+/// asks of it and what it tells it.
+/// </param>
 /// <param name="configurationProvider">The configuration provider.</param>
 /// <param name="logger">The logger instance.</param>
 [ApiController]
@@ -30,12 +35,15 @@ namespace Shoko.Plugin.Forgotten.API.Controllers.v1;
 public class ForgottenController(
     IUserService userService,
     TokenStore tokenStore,
+    IAuthenticationThrottleService throttleService,
     ConfigurationProvider<ForgottenPluginConfiguration> configurationProvider,
     ILogger<ForgottenController> logger) : ControllerBase
 {
     private readonly IUserService _userService = userService;
 
     private readonly TokenStore _tokenStore = tokenStore;
+
+    private readonly IAuthenticationThrottleService _throttleService = throttleService;
 
     private readonly ILogger<ForgottenController> _logger = logger;
 
@@ -58,16 +66,19 @@ public class ForgottenController(
         if (TokenStore.NormalizeUsername(request.Username) is not { } username)
             return StatusCode(400, Failure("Invalid username."));
 
+        // Before the account is looked at, so a name the host has locked out
+        // and a name it has never heard of are answered the same way. Nothing
+        // is registered: asking for a reset code is not an attempt at one.
+        if (IsLockedOut(username, out var lockedOutUntil))
+            return RateLimited("Too many attempts. Please try again later.", lockedOutUntil);
+
         var outcome = _tokenStore.TryStartReset(username, ips, out var nextAllowedAt);
         if (outcome is not ResetRequestResult.Ok)
         {
             _logger.LogWarning("Password reset request denied for username {Username}: {Reason}. Client IPs: {IPs}", username, outcome, ips);
-            return RateLimited(outcome switch
-            {
-                ResetRequestResult.AttemptsExhausted => "Too many failed attempts. Please try again later.",
-                ResetRequestResult.AlreadyPending => "A reset code has already been issued. Please use it or wait for it to expire.",
-                _ => "Rate limit exceeded. Please try again later.",
-            }, nextAllowedAt);
+            return RateLimited(outcome is ResetRequestResult.AlreadyPending
+                ? "A reset code has already been issued. Please use it or wait for it to expire."
+                : "Rate limit exceeded. Please try again later.", nextAllowedAt);
         }
 
         // Logged identically whether or not the account exists, and before
@@ -126,15 +137,18 @@ public class ForgottenController(
             return StatusCode(400, Failure("Unable to determine client IP address."));
         }
 
-        var result = _tokenStore.TryVerify(request.Username, request.Token, ips, out var nextAllowedAt);
+        if (TokenStore.NormalizeUsername(request.Username) is not { } username)
+            return StatusCode(400, Failure("Invalid username or token format. A token is 12 hexadecimal characters."));
+
+        if (IsLockedOut(username, out var lockedOutUntil))
+            return RateLimited("Too many attempts. Please try again later.", lockedOutUntil);
+
+        var result = _tokenStore.TryVerify(username, request.Token, ips);
+        RegisterTokenOutcome(result);
         switch (result)
         {
             case TokenAttemptResult.Malformed:
                 return StatusCode(400, Failure("Invalid username or token format. A token is 12 hexadecimal characters."));
-
-            case TokenAttemptResult.RateLimited:
-                _logger.LogWarning("Token verification rate limited for IP: {IPs}", ips);
-                return RateLimited("Too many attempts. Please try again later.", nextAllowedAt);
 
             case TokenAttemptResult.LockedOut:
                 // Answered exactly as an unknown token is. A lockout can only
@@ -146,6 +160,12 @@ public class ForgottenController(
                 return Ok(new ForgottenResponse { Success = true, Valid = false });
 
             default:
+                // Nothing is cleared on the way out, even when the token
+                // holds. This endpoint answers a question rather than
+                // performing a reset, and the same token answers it for
+                // fifteen minutes - so clearing the host's ledger here would
+                // hand whoever holds one token an unlimited supply of fresh
+                // password guesses at every other door.
                 return Ok(new ForgottenResponse { Success = true, Valid = result is TokenAttemptResult.Ok });
         }
     }
@@ -174,15 +194,18 @@ public class ForgottenController(
         if (!TokenStore.IsAcceptablePassword(request.NewPassword))
             return StatusCode(400, Failure($"Password cannot be longer than {TokenStore.MaxPasswordLength} characters."));
 
-        var result = _tokenStore.TryConsume(request.Username, request.Token, ips, out var ticket, out var nextAllowedAt);
+        if (TokenStore.NormalizeUsername(request.Username) is not { } username)
+            return StatusCode(400, Failure("Invalid username or token format. A token is 12 hexadecimal characters."));
+
+        if (IsLockedOut(username, out var lockedOutUntil))
+            return RateLimited("Too many attempts. Please try again later.", lockedOutUntil);
+
+        var result = _tokenStore.TryConsume(username, request.Token, ips, out var ticket);
+        RegisterTokenOutcome(result);
         switch (result)
         {
             case TokenAttemptResult.Malformed:
                 return StatusCode(400, Failure("Invalid username or token format. A token is 12 hexadecimal characters."));
-
-            case TokenAttemptResult.RateLimited:
-                _logger.LogWarning("Password reset rate limited for IP: {IPs}", ips);
-                return RateLimited("Too many attempts. Please try again later.", nextAllowedAt);
 
             case TokenAttemptResult.LockedOut:
                 // Same answer as any other failure, for the reason in
@@ -195,9 +218,9 @@ public class ForgottenController(
                 return StatusCode(403, Failure("Invalid or expired token."));
         }
 
-        // Normalized, because the store trims and the host does not: an
-        // untrimmed name verified here and 404'd there, costing an attempt
-        // for input the previous call had just called valid.
+        // The normalized name, because the store trims and the host does
+        // not: an untrimmed name verified here and 404'd there, costing an
+        // attempt for input the previous call had just called valid.
         //
         // Guarded, because this is the one call between spending the token
         // and settling for it. An exception escaping here left the ticket
@@ -207,7 +230,7 @@ public class ForgottenController(
         IUser? user;
         try
         {
-            user = _userService.GetUserByUsername(TokenStore.NormalizeUsername(request.Username)!);
+            user = _userService.GetUserByUsername(username);
         }
         catch (Exception ex)
         {
@@ -243,6 +266,15 @@ public class ForgottenController(
         // The password is changed, so the token really is spent — and with it
         // anything else the account had outstanding.
         ticket!.Commit();
+
+        // Both dimensions are cleared here, and only here. This is the one
+        // place where an account's credential has actually changed, so every
+        // failure counted against the old one is stale — and the person this
+        // plugin exists for is somebody the host has already locked out for
+        // forgetting it. Leaving the lockout standing would let them complete
+        // a reset and still not be able to sign in.
+        _throttleService.Reset(HttpContext);
+        _throttleService.Reset(user);
         _logger.LogWarning("Password reset successful for user {Username}. Client IPs: {IPs}", user.Username, ips);
 
         try
@@ -284,19 +316,24 @@ public class ForgottenController(
             });
         }
 
-        if (_tokenStore.IsAttemptBudgetExhausted(ips, out var nextAllowedAt))
+        // No username is named here, so only the client dimension can be
+        // read — and only read. Handing out the list of accounts is not an
+        // attempt at a credential, so nothing is registered; but a client the
+        // host has shut out for guessing does not get to collect the names
+        // either.
+        if (IsClientLockedOut(out var lockedOutUntil))
         {
-            _logger.LogWarning("Username recovery request denied — IP locked out from too many failed attempts. Client IPs: {IPs}", ips);
+            _logger.LogWarning("Username recovery request denied — this client is locked out. Client IPs: {IPs}", ips);
             return RateLimited(new RequestUsernamesResponse
             {
-                Message = "Too many failed attempts. Please try again later.",
-                RetryAfter = nextAllowedAt,
-            }, nextAllowedAt);
+                Message = "Too many attempts. Please try again later.",
+                RetryAfter = lockedOutUntil,
+            }, lockedOutUntil);
         }
 
         // Claiming the cooldown and dumping the names is one operation, so
         // two requests arriving together cannot both find the cooldown clear.
-        if (!_tokenStore.TryRecordUsernameRequest(out nextAllowedAt))
+        if (!_tokenStore.TryRecordUsernameRequest(out var nextAllowedAt))
         {
             _logger.LogWarning("Username recovery request denied due to global rate limiting. Client IPs: {IPs}", ips);
             return RateLimited(new RequestUsernamesResponse
@@ -318,6 +355,129 @@ public class ForgottenController(
         });
     }
 
+    #region Throttling
+
+    /// <summary>
+    /// Refuses a caller the host has locked out, either as a client or under
+    /// the username it named.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A reset code is a credential, and a wrong one is a wrong credential,
+    /// so the guessing is counted in the store the host counts wrong
+    /// passwords in rather than in one this plugin keeps to itself. A client
+    /// working through codes finds every door shut, and a client the core
+    /// already shut out finds these ones closed too.
+    /// </para>
+    /// <para>
+    /// The username passed is the one the caller named, never the code it
+    /// submitted. The host files usernames and client addresses in separate
+    /// namespaces, so a code in the username slot would land among the
+    /// usernames, where one that read like a real account would share that
+    /// account's lockout in both directions — and the host logs the username
+    /// it was asked about at warning level, which would write a live reset
+    /// code to the console for anyone to collect.
+    /// </para>
+    /// <para>
+    /// Call this before the account is looked up. The host counts failures
+    /// for any username it is given, existing or not, so a name it has locked
+    /// out and a name it has never heard of are answered identically — which
+    /// is the one property every other line of these endpoints is written to
+    /// preserve.
+    /// </para>
+    /// </remarks>
+    /// <param name="username">The normalized username the caller named.</param>
+    /// <param name="lockedOutUntil">When locked out, when the caller may return.</param>
+    /// <returns><c>true</c> when the caller is locked out.</returns>
+    private bool IsLockedOut(string username, out DateTimeOffset? lockedOutUntil)
+    {
+        // Sets Retry-After and logs the throttled attempt itself. The status
+        // result it hands back is dropped: these endpoints carry a body the
+        // wizard reads a message and a retryAfter out of.
+        if (_throttleService.ThrottleAuthentication(HttpContext, username) is null)
+        {
+            lockedOutUntil = null;
+            return false;
+        }
+
+        lockedOutUntil = ThrottledUntil();
+        return true;
+    }
+
+    /// <summary>
+    /// Refuses a caller the host has locked out, where no username is named.
+    /// </summary>
+    /// <param name="lockedOutUntil">When locked out, when the caller may return.</param>
+    /// <returns><c>true</c> when the client is locked out.</returns>
+    private bool IsClientLockedOut(out DateTimeOffset? lockedOutUntil)
+    {
+        if (_throttleService.GetRemainingLockout(HttpContext) is not { } remaining)
+        {
+            lockedOutUntil = null;
+            return false;
+        }
+
+        lockedOutUntil = DateTimeOffset.UtcNow + remaining;
+        return true;
+    }
+
+    /// <summary>
+    /// Counts a code that checked out against nothing as a failure by the
+    /// client, and by the client alone.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Only the client dimension is written. Charging the account would let
+    /// anyone who can name a username lock its owner out of signing in, which
+    /// is a denial of service dressed as a security control — and here the
+    /// username is whatever the request said it was, so it would be a
+    /// particularly cheap one.
+    /// </para>
+    /// <para>
+    /// <see cref="TokenAttemptResult.Malformed"/> is not charged: it is
+    /// decided from the shape of the input alone, without consulting any
+    /// account, and a string that could not be a code was never a guess at
+    /// one. Neither is a correct code that the host then refused to act on —
+    /// an overlong password, an account that went away, a host that threw —
+    /// because nothing was guessed in any of those.
+    /// </para>
+    /// <para>
+    /// <see cref="TokenAttemptResult.LockedOut"/> is charged exactly as
+    /// <see cref="TokenAttemptResult.Invalid"/> is. The two are
+    /// indistinguishable on the wire on purpose, and a difference in what
+    /// they cost would be the same disclosure by another route.
+    /// </para>
+    /// </remarks>
+    /// <param name="result">The outcome the store reported.</param>
+    private void RegisterTokenOutcome(TokenAttemptResult result)
+    {
+        if (result is TokenAttemptResult.Invalid or TokenAttemptResult.LockedOut)
+            _throttleService.RegisterFailure(HttpContext);
+    }
+
+    /// <summary>
+    /// Reads back the instant the host's throttle just set, so this plugin's
+    /// own response body can carry it.
+    /// </summary>
+    /// <remarks>
+    /// Taken from the header rather than asked for directly, because it is
+    /// the only way to see the username half of the lockout:
+    /// <see cref="IAuthenticationThrottleService.GetRemainingLockout(IUser)"/>
+    /// wants an <see cref="IUser"/>, and looking one up is precisely what
+    /// must not happen before the throttle has spoken. The client half is the
+    /// fallback, and understates rather than invents.
+    /// </remarks>
+    /// <returns>When the caller may return, or <c>null</c> when it cannot be told.</returns>
+    private DateTimeOffset? ThrottledUntil()
+    {
+        if (int.TryParse(Response.Headers.RetryAfter.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var seconds) && seconds > 0)
+            return DateTimeOffset.UtcNow.AddSeconds(seconds);
+
+        return _throttleService.GetRemainingLockout(HttpContext) is { } remaining ? DateTimeOffset.UtcNow + remaining : null;
+    }
+
+    #endregion
+
     private static ForgottenResponse Failure(string message)
         => new() { Success = false, Message = message };
 
@@ -328,7 +488,9 @@ public class ForgottenController(
     {
         if (nextAllowedAt.HasValue)
         {
-            var retryAfterSeconds = (int)Math.Max(0, (nextAllowedAt.Value - DateTimeOffset.UtcNow).TotalSeconds);
+            // Rounded up, never down: a Retry-After of zero invites the very
+            // next request to be another refusal.
+            var retryAfterSeconds = (int)Math.Max(0, Math.Ceiling((nextAllowedAt.Value - DateTimeOffset.UtcNow).TotalSeconds));
             Response.Headers.RetryAfter = retryAfterSeconds.ToString(CultureInfo.InvariantCulture);
         }
 

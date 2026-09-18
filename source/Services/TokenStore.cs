@@ -9,8 +9,8 @@ using System.Threading;
 namespace Shoko.Plugin.Forgotten.Services;
 
 /// <summary>
-/// Every reset token the plugin has issued, and every rate limit that
-/// governs issuing and spending them.
+/// Every reset token the plugin has issued, the quotas that govern asking
+/// for one, and the ceiling that retires one.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -50,14 +50,8 @@ public sealed class TokenStore : IDisposable
     /// <summary>The window over which reset requests are counted per address.</summary>
     public static readonly TimeSpan ResetRequestWindow = TimeSpan.FromDays(1);
 
-    /// <summary>The window over which verify and reset attempts are counted per address.</summary>
-    public static readonly TimeSpan VerifyAttemptWindow = TimeSpan.FromDays(1);
-
     /// <summary>Reset tokens one address may ask for per <see cref="ResetRequestWindow"/>.</summary>
     public const int MaxResetRequestsPerIp = 5;
-
-    /// <summary>Token attempts one address may spend per <see cref="VerifyAttemptWindow"/>.</summary>
-    public const int MaxVerifyAttemptsPerIp = 10;
 
     /// <summary>Wrong tokens an account will tolerate before its live token is retired.</summary>
     public const int MaxFailedAttemptsPerToken = 5;
@@ -94,8 +88,6 @@ public sealed class TokenStore : IDisposable
     private readonly Dictionary<string, TokenEntry> _tokens = new(StringComparer.InvariantCultureIgnoreCase);
 
     private readonly Dictionary<string, WindowEntry> _resetRequests = new(StringComparer.Ordinal);
-
-    private readonly Dictionary<string, WindowEntry> _verifyAttempts = new(StringComparer.Ordinal);
 
     /// <summary>
     /// One entry per reset asked for from an address for an account, whether
@@ -251,27 +243,10 @@ public sealed class TokenStore : IDisposable
     }
 
     /// <summary>
-    /// Reports whether an address has spent its whole attempt budget.
-    /// </summary>
-    /// <remarks>
-    /// This reads without spending, and is used by the endpoints that are
-    /// gated by the attempt budget without being attempts themselves. It is
-    /// a check with no matching act, so there is nothing here to race.
-    /// </remarks>
-    /// <param name="ip">The client address.</param>
-    /// <param name="nextAllowedAt">When exhausted, when the window rolls over.</param>
-    /// <returns><c>true</c> when the address has nothing left to spend.</returns>
-    public bool IsAttemptBudgetExhausted(string ip, out DateTimeOffset? nextAllowedAt)
-    {
-        lock (_gate)
-            return !HasBudget(_verifyAttempts, ip, MaxVerifyAttemptsPerIp, VerifyAttemptWindow, Now, out nextAllowedAt);
-    }
-
-    /// <summary>
     /// Claims the right to ask for a reset token for an account.
     /// </summary>
     /// <remarks>
-    /// The per-address daily budget is taken here, atomically, and only when
+    /// The per-address daily quota is taken here, atomically, and only when
     /// the request is going to be allowed. The caller then asks the host
     /// whether the account exists and calls <see cref="Generate"/> or
     /// <see cref="GenerateDummy"/>; that lookup is a host round-trip and is
@@ -289,12 +264,7 @@ public sealed class TokenStore : IDisposable
         lock (_gate)
         {
             var now = Now;
-
-            // An address that has burned its attempt budget is not allowed to
-            // mint fresh material either; this reads the budget without
-            // spending it, because asking for a token is not an attempt.
-            if (!HasBudget(_verifyAttempts, ip, MaxVerifyAttemptsPerIp, VerifyAttemptWindow, now, out nextAllowedAt))
-                return ResetRequestResult.AttemptsExhausted;
+            nextAllowedAt = null;
 
             // One request per account and address at a time: a second while
             // the first is still good is far more likely to be a resend than
@@ -374,32 +344,21 @@ public sealed class TokenStore : IDisposable
     /// <summary>
     /// Checks a token against an account without spending it.
     /// </summary>
+    /// <remarks>
+    /// Nothing here counts a wrong guess against the address any more. That
+    /// ledger is the host's, shared with the core sign-in and with every
+    /// other plugin, and the controller writes to it — see
+    /// <c>ForgottenController</c>. What stays here is the account's own
+    /// ceiling, which retires a token rather than locking anybody out.
+    /// </remarks>
     /// <param name="username">The username as submitted.</param>
     /// <param name="token">The token as submitted.</param>
     /// <param name="ip">The client address.</param>
-    /// <param name="nextAllowedAt">When rate limited, when the window rolls over.</param>
     /// <returns>The outcome, in enough detail for the caller to answer honestly.</returns>
-    public TokenAttemptResult TryVerify(string username, string token, string ip, out DateTimeOffset? nextAllowedAt)
+    public TokenAttemptResult TryVerify(string username, string token, string ip)
     {
         lock (_gate)
-        {
-            var now = Now;
-            if (!HasBudget(_verifyAttempts, ip, MaxVerifyAttemptsPerIp, VerifyAttemptWindow, now, out nextAllowedAt))
-                return TokenAttemptResult.RateLimited;
-
-            var result = Check(username, token, ip, out nextAllowedAt, out _);
-
-            // A wrong answer costs the address one of its attempts; a right
-            // one does not, so that verifying a token and then spending it
-            // is one attempt rather than two. A locked one costs the same as
-            // a wrong one - it is indistinguishable on the wire, and it must
-            // be indistinguishable in what it costs too, or it is a probe
-            // that can be repeated for ever.
-            if (result is TokenAttemptResult.Invalid or TokenAttemptResult.LockedOut)
-                TrySpend(_verifyAttempts, ip, MaxVerifyAttemptsPerIp, VerifyAttemptWindow, now, out _);
-
-            return result;
-        }
+            return Check(username, token, ip, out _);
     }
 
     /// <summary>
@@ -418,22 +377,13 @@ public sealed class TokenStore : IDisposable
     /// <param name="token">The token as submitted.</param>
     /// <param name="ip">The client address.</param>
     /// <param name="ticket">The claim on the spent token, when the outcome is <see cref="TokenAttemptResult.Ok"/>.</param>
-    /// <param name="nextAllowedAt">When rate limited, when the window rolls over.</param>
     /// <returns>The outcome.</returns>
-    public TokenAttemptResult TryConsume(string username, string token, string ip, out ResetTicket? ticket, out DateTimeOffset? nextAllowedAt)
+    public TokenAttemptResult TryConsume(string username, string token, string ip, out ResetTicket? ticket)
     {
         ticket = null;
         lock (_gate)
         {
-            var now = Now;
-
-            // Unlike verification, spending always costs an attempt: this is
-            // the endpoint that changes something, and a caller that reaches
-            // it has committed to a guess either way.
-            if (!TrySpend(_verifyAttempts, ip, MaxVerifyAttemptsPerIp, VerifyAttemptWindow, now, out nextAllowedAt))
-                return TokenAttemptResult.RateLimited;
-
-            var result = Check(username, token, ip, out _, out var entry);
+            var result = Check(username, token, ip, out var entry);
             if (result is not TokenAttemptResult.Ok)
                 return result;
 
@@ -447,9 +397,8 @@ public sealed class TokenStore : IDisposable
     /// The single statement of what makes a submitted token good. Must be
     /// called under <see cref="_gate"/>.
     /// </summary>
-    private TokenAttemptResult Check(string username, string token, string ip, out DateTimeOffset? nextAllowedAt, out TokenEntry? entry)
+    private TokenAttemptResult Check(string username, string token, string ip, out TokenEntry? entry)
     {
-        nextAllowedAt = null;
         entry = null;
 
         if (NormalizeUsername(username) is not { } normalizedUsername)
@@ -472,10 +421,7 @@ public sealed class TokenStore : IDisposable
         }
 
         if (candidate.FailedAttempts >= MaxFailedAttemptsPerToken)
-        {
-            nextAllowedAt = candidate.ExpiresAt;
             return TokenAttemptResult.LockedOut;
-        }
 
         // The token is the secret, so it is compared without leaking where
         // it first differed. The username is not a secret — the host itself
@@ -489,7 +435,8 @@ public sealed class TokenStore : IDisposable
             // contains - the binding above refuses it - so counting it bought
             // no protection and let a stranger burn a victim's five attempts
             // and deny them a reset for as long as the token lived. Guessing
-            // from elsewhere is still bounded, by that address's own budget.
+            // from elsewhere is still bounded, by the host's shared lockout
+            // that the controller charges the client for.
             if (string.Equals(candidate.IpAddress, ip, StringComparison.Ordinal))
                 candidate.FailedAttempts++;
             return TokenAttemptResult.Invalid;
@@ -531,20 +478,6 @@ public sealed class TokenStore : IDisposable
 
     private static string PendingKey(string ip, string username)
         => $"{ip}\n{username}";
-
-    /// <summary>
-    /// Whether a key has anything left in its window. Must be called under
-    /// <see cref="_gate"/>.
-    /// </summary>
-    private static bool HasBudget(Dictionary<string, WindowEntry> counters, string key, int limit, TimeSpan window, DateTimeOffset now, out DateTimeOffset? nextAllowedAt)
-    {
-        nextAllowedAt = null;
-        if (!counters.TryGetValue(key, out var entry) || now - entry.WindowStart >= window || entry.Count < limit)
-            return true;
-
-        nextAllowedAt = entry.WindowStart + window;
-        return false;
-    }
 
     /// <summary>
     /// Takes one from a key's window if there is one to take, and says so.
@@ -603,9 +536,6 @@ public sealed class TokenStore : IDisposable
 
             foreach (var key in _resetRequests.Where(pair => now - pair.Value.WindowStart >= ResetRequestWindow).Select(pair => pair.Key).ToArray())
                 _resetRequests.Remove(key);
-
-            foreach (var key in _verifyAttempts.Where(pair => now - pair.Value.WindowStart >= VerifyAttemptWindow).Select(pair => pair.Key).ToArray())
-                _verifyAttempts.Remove(key);
 
             foreach (var key in _pendingRequests.Where(pair => now >= pair.Value).Select(pair => pair.Key).ToArray())
                 _pendingRequests.Remove(key);

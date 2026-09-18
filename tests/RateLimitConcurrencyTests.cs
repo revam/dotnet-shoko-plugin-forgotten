@@ -65,31 +65,18 @@ public class RateLimitConcurrencyTests
     }
 
     [Fact]
-    public void An_address_gets_its_daily_attempts_and_no_more_however_they_arrive()
-    {
-        using var store = new TokenStore(new TestTimeProvider());
-
-        // Distinct accounts, so nothing is stopped early by an account's own
-        // ceiling and the address budget is the only thing being tested.
-        var results = RaceEveryone(index => store.TryVerify($"ghost{index}", index.ToString("X12"), Ip, out _));
-
-        Assert.Equal(TokenStore.MaxVerifyAttemptsPerIp, results.Count(result => result is TokenAttemptResult.Invalid));
-        Assert.Equal(Racers - TokenStore.MaxVerifyAttemptsPerIp, results.Count(result => result is TokenAttemptResult.RateLimited));
-    }
-
-    [Fact]
     public void An_account_takes_its_ceiling_of_wrong_guesses_and_no_more()
     {
         var clock = new TestTimeProvider();
         using var store = new TokenStore(clock);
         store.Generate("admin", Ip);
 
-        // Address budget out of the way: this is about the per-account
-        // ceiling, which is the smaller of the two.
-        var results = RaceEveryone(index => store.TryVerify("admin", index.ToString("X12"), Ip, out _));
+        // The per-account ceiling is all that is left in this store; the
+        // per-address one is the host's now.
+        var results = RaceEveryone(index => store.TryVerify("admin", index.ToString("X12"), Ip));
 
         Assert.Equal(TokenStore.MaxFailedAttemptsPerToken, results.Count(result => result is TokenAttemptResult.Invalid));
-        Assert.All(results, result => Assert.True(result is TokenAttemptResult.Invalid or TokenAttemptResult.LockedOut or TokenAttemptResult.RateLimited));
+        Assert.All(results, result => Assert.True(result is TokenAttemptResult.Invalid or TokenAttemptResult.LockedOut));
     }
 
     /// <summary>
@@ -122,7 +109,7 @@ public class RateLimitConcurrencyTests
         var tickets = new ConcurrentBag<TokenStore.ResetTicket>();
         var results = RaceEveryone(index =>
         {
-            var result = store.TryConsume("admin", token, Ip, out var ticket, out _);
+            var result = store.TryConsume("admin", token, Ip, out var ticket);
             if (ticket is not null)
                 tickets.Add(ticket);
             return result;

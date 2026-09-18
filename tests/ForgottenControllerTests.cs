@@ -20,15 +20,21 @@ public class ForgottenControllerTests
 {
     private const string Ip = "203.0.113.7";
 
-    private sealed record Harness(ForgottenController Controller, FakeUserService Users, TokenStore Store, TestTimeProvider Clock);
+    private sealed record Harness(
+        ForgottenController Controller,
+        FakeUserService Users,
+        TokenStore Store,
+        TestTimeProvider Clock,
+        FakeAuthenticationThrottleService Throttle);
 
     private static Harness NewHarness(string ip = Ip)
     {
         var clock = new TestTimeProvider();
         var store = new TokenStore(clock);
         var users = new FakeUserService();
+        var throttle = new FakeAuthenticationThrottleService();
         var provider = new ConfigurationProvider<ForgottenPluginConfiguration>(new FakeConfigurationService(new ForgottenPluginConfiguration()));
-        var controller = new ForgottenController(users, store, provider, NullLogger<ForgottenController>.Instance)
+        var controller = new ForgottenController(users, store, throttle, provider, NullLogger<ForgottenController>.Instance)
         {
             ControllerContext = new()
             {
@@ -39,7 +45,7 @@ public class ForgottenControllerTests
             },
         };
 
-        return new(controller, users, store, clock);
+        return new(controller, users, store, clock, throttle);
     }
 
     private static int StatusOf<T>(ActionResult<T> result)
@@ -299,13 +305,11 @@ public class ForgottenControllerTests
     }
 
     [Fact]
-    public void An_address_out_of_attempts_gets_a_429_and_a_retry_after_header()
+    public void A_locked_out_address_gets_a_429_and_a_retry_after_header()
     {
         var harness = NewHarness();
         harness.Users.Add("admin");
-
-        for (var attempt = 0; attempt < TokenStore.MaxVerifyAttemptsPerIp; attempt++)
-            harness.Controller.VerifyToken(new() { Username = $"ghost{attempt}", Token = attempt.ToString("X12") });
+        harness.Throttle.ClientLockout = TimeSpan.FromMinutes(15);
 
         var result = harness.Controller.VerifyToken(new() { Username = "admin", Token = "0000-0000-0001" });
 
