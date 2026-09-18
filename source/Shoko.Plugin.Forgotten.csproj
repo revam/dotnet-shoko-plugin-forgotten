@@ -23,7 +23,7 @@
     </ItemGroup>
 
     <ItemGroup>
-        <PackageReference Include="Shoko.Abstractions" Version="6.0.0-alpha.81" ExcludeAssets="runtime" />
+        <PackageReference Include="Shoko.Abstractions" Version="6.0.0-alpha.89" ExcludeAssets="runtime" />
         <PackageReference Include="Newtonsoft.Json" Version="13.0.4" ExcludeAssets="runtime" />
     </ItemGroup>
 
