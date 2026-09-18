@@ -155,6 +155,12 @@ internal sealed class FakeConfigurationService(ForgottenPluginConfiguration conf
     public TConfig Load<TConfig>(bool copy = false) where TConfig : class, IConfiguration, new()
         => (TConfig)(object)configuration;
 
+    public string SerializeWithMasking(IConfiguration config) => throw new NotSupportedException();
+
+    public string MaskSecrets(ConfigurationInfo info, string json) => throw new NotSupportedException();
+
+    public string RestoreMaskedSecrets(ConfigurationInfo info, string json) => throw new NotSupportedException();
+
     public IReadOnlyDictionary<Guid, IReadOnlySet<string>> RestartPendingFor => throw new NotSupportedException();
 
     public IReadOnlyDictionary<Guid, IReadOnlySet<string>> LoadedEnvironmentVariables => throw new NotSupportedException();
