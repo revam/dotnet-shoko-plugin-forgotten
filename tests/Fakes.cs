@@ -1,9 +1,11 @@
+using System.Globalization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.SignalR;
 using Shoko.Abstractions.Config;
 using Shoko.Abstractions.Config.Enums;
 using Shoko.Abstractions.Config.Events;
 using Shoko.Abstractions.Config.Services;
+using Shoko.Abstractions.Metadata;
 using Shoko.Abstractions.Metadata.Anidb;
 using Shoko.Abstractions.Metadata.Enums;
 using Shoko.Abstractions.Metadata.Shoko;
@@ -59,7 +61,7 @@ internal sealed class FakeUserService : IUserService
 
     public IEnumerable<IUser> GetUsers() => _users;
 
-    public IUser? GetUserByID(int id) => _users.FirstOrDefault(user => user.ID == id);
+    public IUser? GetUserByID(int id) => _users.FirstOrDefault(user => user.LocalID == id);
 
     // Matched the way the host matches it, which is the whole point of
     // several of these tests.
@@ -123,11 +125,11 @@ internal sealed class FakeUserService : IUserService
 /// </summary>
 internal sealed class FakeUser(int id, string username) : IUser
 {
-    public int ID { get; } = id;
+    public int LocalID { get; } = id;
+
+    public MetadataGuid ID => new(MetadataSource.Shoko, MetadataEntityType.User, LocalID.ToString(CultureInfo.InvariantCulture));
 
     public string Username { get; } = username;
-
-    public DataSource Source => DataSource.Shoko;
 
     public bool IsAdmin => false;
 
