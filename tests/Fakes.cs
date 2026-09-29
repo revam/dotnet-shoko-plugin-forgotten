@@ -59,6 +59,10 @@ internal sealed class FakeUserService : IUserService
 
     public event EventHandler<UserChangedEventArgs>? UserRemoved;
 
+    public event EventHandler<ApiTokenChangedEventArgs>? ApiTokenGenerated;
+
+    public event EventHandler<ApiTokenChangedEventArgs>? ApiTokenInvalidated;
+
     public IEnumerable<IUser> GetUsers() => _users;
 
     public IUser? GetUserByID(int id) => _users.FirstOrDefault(user => user.LocalID == id);

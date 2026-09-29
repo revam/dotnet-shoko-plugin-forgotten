@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
 using Shoko.Abstractions.User;
+using Shoko.Abstractions.User.Events;
 using Shoko.Abstractions.User.Services;
 
 namespace Shoko.Plugin.Forgotten.Tests;
@@ -17,6 +18,9 @@ namespace Shoko.Plugin.Forgotten.Tests;
 /// </remarks>
 internal sealed class FakeAuthenticationThrottleService : IAuthenticationThrottleService
 {
+    /// <inheritdoc/>
+    public event EventHandler<AuthenticationFailedEventArgs>? AuthenticationFailed { add { } remove { } }
+
     /// <summary>What a test wants the client to be locked out for, if at all.</summary>
     public TimeSpan? ClientLockout { get; set; }
 
