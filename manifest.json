@@ -13,6 +13,22 @@
   ],
   "releases": [
     {
+      "version": "1.0.5",
+      "tag": "v1.0.5",
+      "released_at": "2026-09-30T16:38:17.9436075Z",
+      "channel": "Stable",
+      "release_notes": "Rebuilt against the abstractions \u00606.0.0-alpha.95\u0060 release. Password resets and username recovery work as before.\n\nRequires Shoko Server with abstractions \u00606.0.0-alpha.95\u0060.",
+      "dependencies": [],
+      "archives": [
+        {
+          "runtime": "any",
+          "abstraction": "6.0.0",
+          "url": "https://github.com/revam/dotnet-shoko-plugin-forgotten/releases/download/v1.0.5/Forgotten-v1.0.5-any.zip",
+          "checksum": "sha256:8a0129f0d67d85497b201edeadb955c55a801aac833606e46a2fe5b0d11c13d1"
+        }
+      ]
+    },
+    {
       "version": "1.0.4",
       "tag": "v1.0.4",
       "released_at": "2026-09-18T04:46:22.7142489Z",
