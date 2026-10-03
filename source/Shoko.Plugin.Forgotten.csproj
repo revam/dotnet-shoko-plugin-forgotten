@@ -23,7 +23,7 @@
     </ItemGroup>
 
     <ItemGroup>
-        <PackageReference Include="Shoko.Abstractions" Version="6.0.0-alpha.95" ExcludeAssets="runtime" />
+        <PackageReference Include="Shoko.Abstractions" Version="6.0.0-alpha.98" ExcludeAssets="runtime" />
         <PackageReference Include="Newtonsoft.Json" Version="13.0.4" ExcludeAssets="runtime" />
     </ItemGroup>
 
@@ -32,7 +32,7 @@
              discovery. PrivateAssets alone is not enough: without ExcludeAssets
              the package's own MSBuild tasks and satellite assemblies end up in
              the plugin output. -->
-        <PackageReference Include="Shoko.BuildTools.Targets" Version="0.3.0" PrivateAssets="All" ExcludeAssets="runtime" />
+        <PackageReference Include="Shoko.BuildTools.Targets" Version="0.3.1" PrivateAssets="All" ExcludeAssets="runtime" />
         <PackageReference Include="Microsoft.CodeAnalysis.NetAnalyzers" Version="10.0.203" PrivateAssets="All" />
         <PackageReference Include="SmartAnalyzers.MultithreadingAnalyzer" Version="1.1.31" PrivateAssets="All" />
     </ItemGroup>
