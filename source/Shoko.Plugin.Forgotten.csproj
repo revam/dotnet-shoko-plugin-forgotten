@@ -15,6 +15,12 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <!-- The plugin's thumbnail and icon, read by the server through the plugin. -->
+        <EmbeddedResource Include="Assets\thumbnail.svg" LogicalName="Shoko.Plugin.Forgotten.Assets.thumbnail.svg" />
+        <EmbeddedResource Include="Assets\icon.svg" LogicalName="Shoko.Plugin.Forgotten.Assets.icon.svg" />
+    </ItemGroup>
+
+    <ItemGroup>
         <FrameworkReference Include="Microsoft.AspNetCore.App" />
     </ItemGroup>
 
