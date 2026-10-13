@@ -13,6 +13,22 @@
   ],
   "releases": [
     {
+      "version": "1.0.8",
+      "tag": "v1.0.8",
+      "released_at": "2026-10-13T19:40:36.4738746Z",
+      "channel": "Stable",
+      "release_notes": "Rebuilt against the abstractions \u00606.0.0-alpha.104\u0060 release.\n\nRequires Shoko Server with abstractions \u00606.0.0-alpha.104\u0060.",
+      "dependencies": [],
+      "archives": [
+        {
+          "runtime": "any",
+          "abstraction": "6.0.0",
+          "url": "https://github.com/revam/dotnet-shoko-plugin-forgotten/releases/download/v1.0.8/Forgotten-v1.0.8-any.zip",
+          "checksum": "sha256:96c857d59217c3e0053b403caa152bdb4ec9c9a9de02ad8a06815163aeba7d16"
+        }
+      ]
+    },
+    {
       "version": "1.0.7",
       "tag": "v1.0.7",
       "released_at": "2026-10-06T21:39:45.2012232Z",
