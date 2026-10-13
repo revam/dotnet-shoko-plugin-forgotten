@@ -11,6 +11,8 @@
     "hosted-service",
     "api"
   ],
+  "thumbnail_url": "https://raw.githubusercontent.com/revam/dotnet-shoko-plugin-forgotten/stable/source/Assets/thumbnail.svg",
+  "icon_url": "https://raw.githubusercontent.com/revam/dotnet-shoko-plugin-forgotten/stable/source/Assets/icon.svg",
   "releases": [
     {
       "version": "1.0.8",
