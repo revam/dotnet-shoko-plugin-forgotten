@@ -10,6 +10,7 @@ using Shoko.Abstractions.Metadata.Anidb;
 using Shoko.Abstractions.Metadata.Enums;
 using Shoko.Abstractions.Metadata.Shoko;
 using Shoko.Abstractions.Plugin;
+using Shoko.Abstractions.UI;
 using Shoko.Abstractions.User;
 using Shoko.Abstractions.User.Events;
 using Shoko.Abstractions.User.Services;
@@ -200,6 +201,10 @@ internal sealed class FakeConfigurationService(ForgottenPluginConfiguration conf
 
     public ConfigurationActionResult PerformCustomAction<TConfig>(TConfig configuration, string path, string actionID, IUser? user = null, Uri? uri = null) where TConfig : class, IConfiguration, new() => throw new NotSupportedException();
 
+    public Task<IReadOnlyList<UiOption>> GetOptionsAsync(ConfigurationInfo info, IConfiguration configuration, string path, IUser? user = null, Uri? uri = null) => throw new NotSupportedException();
+
+    public Task<IReadOnlyList<UiOption>> GetOptionsAsync<TConfig>(TConfig configuration, string path, IUser? user = null, Uri? uri = null) where TConfig : class, IConfiguration, new() => throw new NotSupportedException();
+
     public ConfigurationActionResult PerformReactiveAction(ConfigurationInfo info, IConfiguration configuration, string path, ConfigurationActionType actionType, ReactiveEventType reactiveEventType = ReactiveEventType.All, IUser? user = null, Uri? uri = null) => throw new NotSupportedException();
 
     public ConfigurationActionResult PerformReactiveAction<TConfig>(TConfig configuration, string path, ConfigurationActionType actionType, ReactiveEventType reactiveEventType = ReactiveEventType.All, IUser? user = null, Uri? uri = null) where TConfig : class, IConfiguration, new() => throw new NotSupportedException();
@@ -223,6 +228,8 @@ internal sealed class FakeConfigurationService(ForgottenPluginConfiguration conf
     public string GetSchema(ConfigurationInfo info) => throw new NotSupportedException();
 
     public NJsonSchema.JsonSchema GenerateSchema(Type type) => throw new NotSupportedException();
+
+    public UiDefinition GenerateUiDefinition(Type type) => throw new NotSupportedException();
 
     public string Serialize(IConfiguration config) => throw new NotSupportedException();
 
