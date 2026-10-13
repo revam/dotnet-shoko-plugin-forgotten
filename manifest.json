@@ -11,9 +11,23 @@
     "hosted-service",
     "api"
   ],
-  "thumbnail_url": "https://raw.githubusercontent.com/revam/dotnet-shoko-plugin-forgotten/stable/source/Assets/thumbnail.svg",
-  "icon_url": "https://raw.githubusercontent.com/revam/dotnet-shoko-plugin-forgotten/stable/source/Assets/icon.svg",
   "releases": [
+    {
+      "version": "1.0.9",
+      "tag": "v1.0.9",
+      "released_at": "2026-10-13T23:51:03.2728176Z",
+      "channel": "Stable",
+      "release_notes": "Added a thumbnail and an icon for the plugin. Nothing else changed.\n\nRequires Shoko Server with abstractions \u00606.0.0-alpha.104\u0060.",
+      "dependencies": [],
+      "archives": [
+        {
+          "runtime": "any",
+          "abstraction": "6.0.0",
+          "url": "https://github.com/revam/dotnet-shoko-plugin-forgotten/releases/download/v1.0.9/Forgotten-v1.0.9-any.zip",
+          "checksum": "sha256:33abd09583b4291716b8144b179e6a0b2c84cc1427d6da9cddb2bf823cc2705b"
+        }
+      ]
+    },
     {
       "version": "1.0.8",
       "tag": "v1.0.8",
@@ -154,5 +168,7 @@
         }
       ]
     }
-  ]
+  ],
+  "thumbnail_url": "https://raw.githubusercontent.com/revam/dotnet-shoko-plugin-forgotten/stable/source/Assets/thumbnail.svg",
+  "icon_url": "https://raw.githubusercontent.com/revam/dotnet-shoko-plugin-forgotten/stable/source/Assets/icon.svg"
 }
