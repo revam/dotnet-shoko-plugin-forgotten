@@ -25,7 +25,7 @@
     Shoko type will load.
   -->
   <ItemGroup>
-    <PackageReference Include="Shoko.Abstractions" Version="6.0.0-alpha.104" />
+    <PackageReference Include="Shoko.Abstractions" Version="6.0.0-alpha.107" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
   </ItemGroup>
 
