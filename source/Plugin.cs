@@ -1,12 +1,13 @@
 using System;
 using Microsoft.Extensions.DependencyInjection;
 using Shoko.Abstractions.Plugin;
+using Shoko.Plugin.Forgotten.Configuration;
 using Shoko.Plugin.Forgotten.Services;
 
 namespace Shoko.Plugin.Forgotten;
 
 /// <inheritdoc/>
-public class Plugin : IPlugin, IPluginServiceRegistration
+public class Plugin : IPlugin<ForgottenPluginConfiguration>, IPluginServiceRegistration
 {
     /// <inheritdoc/>
     public Guid ID { get; private init; } = new("118ffeee-943d-40b2-af63-2416da4beca9");

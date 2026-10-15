@@ -5,7 +5,7 @@ namespace Shoko.Plugin.Forgotten.Configuration;
 /// <summary>
 /// Configuration for the Forgotten plugin.
 /// </summary>
-public class ForgottenPluginConfiguration : IConfiguration
+public class ForgottenPluginConfiguration : IPluginConfiguration
 {
     /// <summary>
     /// Gets or sets a value indicating whether to trust X-Forwarded-For headers from proxies.
